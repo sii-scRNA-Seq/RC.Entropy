@@ -1,0 +1,875 @@
+```{r}
+library(dplyr)
+
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+library(sf)
+library(tidyr)
+
+library(SpatEntropy)
+library(spatstat)
+#library(RColorBrewer)
+
+SEED = 7
+set.seed(SEED)
+```
+Load functions
+Regional Co-occurence Entropy
+```{r}
+sanity_check_structs <- function(data, partition_map, partitions_sel, dist){
+    #0. Sanity checks
+    is.ppp(data) # returns TRUE
+    is.marked(data) # returns TRUE
+    if(spatstat.geom::is.ppp(data) & !spatstat.geom::is.marked(data) & length(table(data$marks$cat))==1)
+        stop("Data have only 1 category. Use Batty's entropy for this use case.")
+    is.list(partition_map) # returns TRUE if "areas" and FALSE if "sites"
+    is.im(partition_map) # returns TRUE if "areas" and FALSE if "sites"
+    if(spatstat.geom::area.owin(data$window)==1)
+          stop("Nemri's entropy cannot be computed on areas of total size = 1. You should change your measurement unit so that the window size is not 1.")
+}
+
+partition_areas <- function(map, regions, map_type){
+ # Get the area of each partition to table
+  # if pixel image, we count the pixels in each partition
+  if ( map_type == "areas") {
+    T_g <- table(map$v) # Area of each partition
+  }
+  #if sites, we count the sites
+  if ( map_type == "sites") {
+    print("map")
+    T_g <- table(map) # "Area" of each partition
+  }
+  T_g_sub <- T_g[regions] # in partitions_sel
+  T_star <- min(T_g_sub) # area of smallest partition
+  T_tot <- sum(T_g_sub) # total area of partitions in partitions_sel
+    
+  return(list(T_g, T_star, T_tot))
+}
+
+select_points_in_partitions_areas <- function(z, morpho, partitions_sel){
+    # Assign variables to function-to-be
+    # z has just one column
+    data <- z
+    partition_map <- morpho
+    # 1. Assign the cells to their partition based on the factor value for the pixel where they fall
+    cutdata <- cut(unmark(data), z=partition_map )
+    #table(cutdata$marks) #sanity check on the cell to partition attribution - before subsetting partition of interest
+    partition <- cutdata$marks
+    cutdata <- unmark(cutdata)
+    cutdata$marks$partition <- partition
+    cutdata$marks$cat <- data$marks$cat
+    cutdata$marks$p_names <- data$marks$p_names
+    cutdata <- subset(cutdata, partition %in% partitions_sel) # cells in 2 and out of window are removed
+    #table(cutdata$marks$marks.partition) #sanity check on the cell to partition attribution - after subsetting partition of interest
+
+    return(cutdata)
+}
+select_points_in_partitions_sites <- function(z, partitions_sel){
+    # z marks are 'p_names', 'cat' and 'partition
+    data <- z
+    cutdata <- subset(data, marks.partition %in% partitions_sel) 
+    return(cutdata)
+}
+
+count_coocurrences <- function(z, dist){
+  ## does not work for more than sqrt(.Machine$integer.max) = 46340 points
+  ## does not consider distances between 2 points, as long as their distance is less than dist
+    #library(Matrix)
+    
+    # Assign variables to function-to-be
+    # z has just one column
+    data <- z
+
+    ct <- as.vector(data$marks$marks.cat) # vector of the categories for all the points in partitions_sel
+    I = length(table(ct)) # total number of categories observed in partitions_sel
+    coocs_theo <- (I*I +I)/2 # maximum number of different possible co-occurences that could be observed for m=2
+    
+    # 2. calculate pseudo-adjacency matrix
+    eucl <- pairdist(data)  # matrix of pair-wise euclidian distances between cells
+    inradius <- (eucl <= dist) # matrix of pairs of cells at a distance less than threshold = pseudo-adjacency matrix (diagonal is 1)
+
+    #identify which pairs are in the same partition, and in which partition
+    # creates n-by-n matrix where intersections are either 0 (not in the same partition) or the partition number e.g 1, 2...(ID)
+    in_g <- data$marks$marks.partition
+    sameg <- outer(in_g, in_g, "==") # matrix of pairs of cells that fall in the same partition
+
+    # 3. Hadamard product of adjacency matrix and partition matrix 
+    # creates n-by-n matrix where intersections are either 0 (not in the same partition) or the partition number e.g 1, 2...(ID)
+    #ZLdg = eucl * inradius * sameg # turns diagonal into 0's
+    #is_cooc <- (ZLdg>0) # replace all pair-wise distances with 1's
+    ZLdg = inradius * sameg #ignore distances, gives diagonal of 1's
+    #plot(as.im(ZLdg), clipwin=owin(xrange= c(0,100), yrange=c(0,100)))
+    is_cooc <- ZLdg
+    is_cooc[lower.tri(is_cooc)] <- 0 # matrix is symmetrical so co-occurences are double counted as ind1-ind2 and ind2-ind1, remove lower triangle
+    is_cooc[diag(is_cooc)] <- 0 # remove diagonal to avoid counting self-links ind1-ind1
+    #sum(is_cooc) # check number of found- co-occurences
+    #plot(as.im(is_cooc), clipwin=owin(xrange= c(0,100), yrange=c(0,100)))
+    numing <- as.numeric(in_g)
+    whichg <- matrix(numing, nrow=length(numing), ncol=length(numing), byrow=TRUE)
+    cooc_byg <- is_cooc * whichg # puts the partition number (ID) where previously there was 1 indicating the 2 cells are in the same partition g
+    #plot(as.im(cooc_byg), clipwin=owin(xrange= c(0,100), yrange=c(0,100)))
+    
+    # 4. find the points in the partitions of interest and their marks
+    coocs <- which(cooc_byg != 0, arr.ind = T) #gives index position as row / col of all non-zero values in is_cooc 
+    ct1 <- ct[coocs[,1]] # position in row of all-vs-all matrix
+    ct2 <- ct[coocs[,2]] # position in column of all-vs-all matrix
+    ord_ct1 <- pmin(ct1, ct2)
+    ord_ct2 <- pmax(ct1, ct2)
+    ct_pairs <- paste(ord_ct1, ord_ct2, sep=" <-> ") # this is to order so that cat1-cat2 and cat2-cat1 both are counted as cat1-cat2
+    #table(ct_pairs) #check
+    
+    # 5. make a vector of partition ids for each non zero values in coocs_byg
+    cp <- as.vector(data$marks$marks.partition)
+    g <- cp[coocs[,1]] # position in row of all-vs-all matrix # (sum(g == cp[coocs[,2]]) == length(ct_pairs)) # Returns TRUE, no need to order
+    ct_pairs_byg <- data.frame(ct_pairs, ord_ct1, ord_ct2, g)
+    #print(ct_pairs_byg)
+    
+    count_p_g <- ct_pairs_byg %>%
+      group_by(ct_pairs,ord_ct1, ord_ct2,g) %>% summarize(n = n()) 
+    
+    return(count_p_g)
+}
+
+prep_b4_calc_H <- function(df, rep_sim, min_coocs){
+  
+  df["n"] <- df[rep_sim]
+  df[rep_sim] <- NULL
+  
+  #remove pairs that have no occurences across all g's
+  #start by identifying pairs with no occurences for safekeeping
+  df_miss <- df %>% filter(sum_n == 0)
+  nb_pairs_miss <- length(unique(df_miss$ct_pairs))
+  #print(nb_pairs_miss)
+  df <- df %>% filter(sum_n >0)
+  #print(df)
+  nb_pairs <- length(unique(df$ct_pairs))
+  #print(nb_pairs)
+  
+  # replace NA's by 0 to prepare to add 1
+  df$n[is.na(df$n)] <- 0
+ 
+  #identify edge case of pairs not occuring in at least one partition
+  undist <- df %>% filter( n == 0) 
+  uneven_pairs_ls <- unique(undist$ct_pairs)
+  #print(undist)
+  # add 1 to occurence to each partition where there the pair does not occur in at least one partition
+  df$n_mod <- df$n +  (df$ct_pairs %in% uneven_pairs_ls)
+  rm(undist, uneven_pairs_ls)
+  
+  # recalculate total occurences per pair
+  ncoocs_by_ctpairs <-  df[,c("ct_pairs", "n_mod")] %>% # Count the total number of cells from each co-occurence (across all partitions)
+      group_by(ct_pairs) %>% summarise(sum_n_mod= sum(n_mod))
+  df <- inner_join(df, ncoocs_by_ctpairs, by="ct_pairs")
+  
+  # remove pairs where total occurences less than set minimum
+  df <-  df %>% filter( sum_n_mod > min_coocs) 
+  
+  df["n"] <- df["n_mod"]
+  df["sum_n"] <- df["sum_n_mod"]
+  df["n_mod"] <- NULL
+  df["sum_n_mod"] <- NULL
+  
+  return(df)
+}
+
+counts_to_H <- function(df, T_all){
+
+    T_star <- T_all[[2]]
+    T_tot <- T_all[[3]]
+  
+    df$p = df$n / df$sum_n
+    df$plogtg_p = df$p * log(df$Tg / df$p)
+    
+    dec_H_r <- df %>%
+      group_by(ct_pairs) %>% summarise(Hr = sum(plogtg_p)) 
+    
+   # dec_H$n <- ncoocs_by_ctpairs$Cells_in_ct_pairs
+    dec_H_r$Hr_rel <- (dec_H_r$Hr - log(T_star)) / (log(T_tot) - log(T_star))
+    
+    #plot(dec_H_r$Hr_rel)
+    #summary(dec_H_r$Hr_rel)
+    
+    return(list(df, dec_H_r))
+}
+
+```
+
+Create work directory
+```{r}
+workdir <- "~/mouse_brain_alzheimer"
+if (!dir.exists(workdir)){
+  dir.create(workdir)
+}else{
+  print("dir exists")
+}
+setwd(workdir)
+```
+Download data from https://cf.10xgenomics.com/samples/xenium/1.4.0/Xenium_V1_FFPE_TgCRND8_17_9_months/Xenium_V1_FFPE_TgCRND8_17_9_months_outs.zip
+Unzip to workdir
+```{r}
+data.dir <- paste(workdir, "Xenium_V1_FFPE_TgCRND8_17_9_months_outs", sep = "/")
+xenium.obj <- LoadXenium(data.dir, fov = "fov", assay = "Xenium")
+# remove cells with 0 counts
+xenium.obj <- subset(xenium.obj, subset = nCount_Xenium > 0)
+#ImageDimPlot(xenium.obj, fov = "fov", molecules = c("B2m", "Pecam1"), nmols = 20000, flip_xy = FALSE)
+#VlnPlot(xenium.obj, features = c("nFeature_Xenium", "nCount_Xenium"), ncol = 2, pt.size = 0)
+
+xenium.obj <- SCTransform(xenium.obj, assay = "Xenium")
+xenium.obj <- RunPCA(xenium.obj, npcs = 30, features = rownames(xenium.obj))
+xenium.obj <- RunUMAP(xenium.obj, dims = 1:30)
+xenium.obj <- FindNeighbors(xenium.obj, reduction = "pca", dims = 1:30)
+xenium.obj <- FindClusters(xenium.obj, resolution = 0.3)
+
+Idents(xenium.obj) <- xenium.obj$seurat_clusters
+xenium.obj.markers <- FindAllMarkers(xenium.obj, only.pos = FALSE)
+
+xenium.obj.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 20) %>%
+    ungroup() -> top20
+```
+
+
+```{r}
+#Fig S1a
+pdf("~/mouse_brain_alzheimer/figs1a.pdf",     fonts = c("Helvetica"),    # File name
+    width = 14 / 2.54 , height = 8 / 2.54, # Width and height in centimeters converted to #inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+   paper = "A4")          # Paper size
+p <- ImageDimPlot(xenium.obj, group.by = "ident", cols = "alphabet", size =  0.5, flip_xy = FALSE, dark.background = FALSE) + #, border.color = "black", border.size=0.2) + 
+  labs(fill = "Cell types") +
+  theme(
+    panel.background = element_rect(fill="white", color="black", linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.title = element_text(family = "Helvetica", size = 7), 
+    legend.text = element_text(family = "Helvetica", size = 6),
+    legend.key = element_rect(fill = "white", colour = "black", linewidth = 0)) 
+p
+dev.off()
+#ImageDimPlot(xenium.obj, size = 2, flip_xy = FALSE) + scale_fill_brewer(palette="Paired") +theme(panel.background = element_rect(fill="black"))
+
+#Fig S1b
+pdf("~/mouse_brain_alzheimer/figs1b.pdf",         # File name
+    width = 12 / 2.54 , height = 8 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+p <- DimPlot(xenium.obj,  group.by = "ident",  cols = "alphabet", raster=TRUE) +#, label=TRUE, repel = TRUE ) +
+  theme(
+    plot.title = element_blank(),
+    #legend.position = "none",
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"),
+    legend.text = element_text(family = "Helvetica", size = 6),
+    legend.key = element_rect(fill = "white"),#, colour = "white", linewidth = 0),
+    label.text = element_text(family = "Helvetica", size = 6),
+    )
+p$layers[[1]]$aes_params$stroke <- 0
+p$layers[[1]]$aes_params$size <- 0.1
+LabelClusters(p, id="ident", repel = TRUE, family = "Helvetica", size = 2, color = "black")
+p
+dev.off()
+
+library(patchwork)
+
+# identify cells corresponding to astrocytes
+#Fig S1c
+pdf("~/mouse_brain_alzheimer/figs1c.pdf",         # File name
+    width = 8 / 2.54 , height = 10 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+ps<- list()
+for (gene in c("Gja1", "Ntsr2", "Aqp4", "Acsbg1", "Slc39a12")) {
+p <- FeaturePlot(object = xenium.obj, features = gene, raster = TRUE) + 
+  theme(
+    plot.title = element_text(family = "Helvetica", size = 6, face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size =5, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    legend.text=element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.line = element_line(color = "black",linewidth = 0.25),
+    axis.ticks = element_line(color = "black",linewidth = 0.25),
+    legend.key.height= unit(0.1, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    legend.position = c (0.1,0.2),
+    )
+p$layers[[1]]$aes_params$stroke <- 0
+p$layers[[1]]$aes_params$size <- 0.1
+ps[[gene]]<- p
+}
+layout1<-"
+AB
+CD
+E#
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+
+
+
+# identify the cluster corresponding to microglia
+#Fig S1d
+pdf("~/mouse_brain_alzheimer/figs1d.pdf",         # File name
+    width = 8 / 2.54 , height = 10 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+ps<- list()
+for (gene in c("C1qa", "C1qb", "C1qc", "Ctss", "Csf1r")) {
+p <- FeaturePlot(object = xenium.obj, features = gene, raster = TRUE) + 
+  theme(
+    plot.title = element_text(family = "Helvetica", size = 6, face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size =5, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    legend.text=element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.line = element_line(color = "black",linewidth = 0.25),
+    axis.ticks = element_line(color = "black",linewidth = 0.25),
+    legend.key.height= unit(0.1, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    legend.position = c (0.1,0.2),
+    )
+p$layers[[1]]$aes_params$stroke <- 0
+p$layers[[1]]$aes_params$size <- 0.1
+ps[[gene]]<- p
+}
+layout1<-"
+AB
+CD
+E#
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+
+
+
+SaveSeuratRds(xenium.obj, file = "mouse_brain_after_clustering.rds")
+```
+```{r}
+xenium.obj <- LoadSeuratRds("mouse_brain_after_clustering.rds")
+```
+
+SELECT RELEVANT CELL TYPES
+```{r}
+# Subset cells 
+selection <- c("1", "4")
+xenium.obj.sel <- subset(xenium.obj, subset = seurat_clusters %in% selection)
+xenium.obj.sel$seurat_clusters_rd1 <- xenium.obj.sel$seurat_clusters
+
+xenium.obj.sel <- SCTransform(xenium.obj.sel, assay = "Xenium")
+xenium.obj.sel <- RunPCA(xenium.obj.sel, npcs = 30, features = rownames(xenium.obj.sel))
+xenium.obj.sel <- RunUMAP(xenium.obj.sel, dims = 1:30, repulsion.strength = 30)
+xenium.obj.sel <- FindNeighbors(xenium.obj.sel, reduction = "pca", dims = 1:30)
+
+DimPlot(xenium.obj.sel, label=TRUE, repel = TRUE )
+
+combined <- xenium.obj.sel
+## Select a range of resolutions
+resolution.range <- seq(from = 0, to = 1, by = 0.1)
+## Find clusters using a range of resolutions
+combined <- FindClusters(object = combined, resolution = resolution.range)
+library(clustree)
+clustree(combined)
+rm(combined)
+
+
+xenium.obj.sel <- FindClusters(xenium.obj.sel, resolution = 1) # ######### 0.7) ########################
+xenium.obj.sel.markers <- FindAllMarkers(xenium.obj.sel, only.pos = FALSE) 
+
+xenium.obj.sel.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 20) %>%
+    ungroup() -> top20_subcluster_1_4
+
+manual_v1 <- c(
+  "Astrocytes reactive A1 (Fiber tracts)",# 0: Gsn, Vim, Cd44, C3
+  "Astrocytes (Cortex; Dkk3)",# 1 : # Increases neuronal damage
+  "Microglia DAMs (Protective, CDCc11+OPN-)",# 2 : Trem2, Tyrobp
+  "Astrocytes (Hypothalamus; Calb2)",# 3:  ##################
+  "Astrocytes (Thalamus; Slc39a12)",# 4: ################################
+  "Microglia Homeostatic (Cortex)",# 5: P2ry12, Tmem119 ############
+  "Microglia Homeostatic (Cortex)",# 6: P2ry12, Tmem119 ###########
+  "Astrocytes (Hypothalamus; Calb2)",# 7 : ############
+  "Neurons",# 8: Shisa6, Cabp7
+  "Microglia Homeostatic (Thalamus)",# 9: Cx3cr1, P2ry12, Tmem119
+  "Microglia DAMs (Pathogenic, CDCc11+OPN+)",# 10: Spp1, Itgax, Gpnmb
+  "Astrocytes reactive group 2",# 11: Gfap, Vim, Serpina3n, Cd44
+  "Microglia Homeostatic (Hippocampus)",# 12: Cx3cr1, Tmem119 #############
+  "Astrocytes (Striatum; Penk)",# 13: Penk,
+  "Astrocytes (Cortex; Dkk3)",# 14 : # Increases neuronal damage ############
+  "Astrocytes (Cxcl10)",# 15: Cxcl10, Vim
+  "Neurons",# 16: Cbln1, Cbln4 # with adipocytes Slc17a6
+  "Neurons" # 17: Shisa6, Cabp7
+)
+xenium.obj.sel$celltypes_manual_v1 <- manual_v1[as.factor(xenium.obj.sel$seurat_clusters)]
+
+ImageDimPlot(xenium.obj.sel, group.by = "celltypes_manual_v1", cols = "Paired", size = 1.5, flip_xy = FALSE)
+DimPlot(xenium.obj.sel, size = 2, group.by = "celltypes_manual_v1", label=TRUE, repel = TRUE )
+
+#keep only astrocytes and microglia - exclude Neurons clusters
+immune <- subset(xenium.obj.sel, subset = seurat_clusters %in% c("8", "16", "17") , invert =TRUE)
+
+immune_order1 <- c(
+  "Astrocytes (Cortex; Dkk3)",
+  "Astrocytes (Cxcl10)",
+  "Astrocytes (Hypothalamus; Calb2)",
+  "Astrocytes (Striatum; Penk)",
+  "Astrocytes (Thalamus; Slc39a12)",
+  "Astrocytes reactive A1 (Fiber tracts)",
+  "Astrocytes reactive group 2",
+  "Microglia DAMs (Pathogenic, CDCc11+OPN+)",
+  "Microglia DAMs (Protective, CDCc11+OPN-)",
+  "Microglia Homeostatic (Cortex)",
+  "Microglia Homeostatic (Hippocampus)",
+  "Microglia Homeostatic (Thalamus)"
+)
+Idents(immune) <- immune$celltypes_manual_v1
+levels(immune) <- immune_order1
+
+SaveSeuratRds(immune, file = "mouse_brain_after_2nd_clustering.rds")
+```
+
+```{r}
+immune <- LoadSeuratRds("mouse_brain_after_2nd_clustering.rds")
+```
+
+
+```{r}
+colors = brewer.pal(n=length(levels(as.factor(immune$celltypes_manual_v1))), name = "Paired")
+
+#Fig 1c
+df.ct <- as.data.frame(table(immune$celltypes_manual_v1))
+pdf("~/mouse_brain_alzheimer/fig1c.pdf",         # File name
+    width = 6 / 2.54 , height = 7 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+p <- ggplot(df.ct, aes(x=forcats::fct_rev(Var1), y=Freq)) + 
+  geom_bar(stat="identity", fill = colors) + 
+  scale_x_discrete(labels = function(x)  stringr::str_wrap(x, width = 15)) +   coord_flip() +
+    labs(x="Cell counts", y="Cell types") + 
+    theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black", hjust=0.5, lineheight=0.7),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.background = element_rect(fill="white", color="black", linewidth = 0.5),
+        panel.grid.major = element_line(color="grey", linewidth = 0.5),
+        panel.grid.minor = element_line(color="grey", linewidth = 0.25),
+    )
+p
+dev.off()
+
+#Fig S2a
+pdf("~/mouse_brain_alzheimer/figs2a.pdf",         # File name
+    width = 18 / 2.54 , height = 8 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+p <- ImageDimPlot(immune, group.by = "ident", cols = colors, size = 0.5, flip_xy = FALSE, dark.background = FALSE, border.color = "black", border.size=0.2) + 
+  labs(fill = "Cell types") +
+  theme(
+    panel.background = element_rect(fill="white", color="black", linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.title = element_text(family = "Sans", size = 7), 
+    legend.text = element_text(family = "Sans", size = 6),
+    legend.key = element_rect(fill = "white", colour = "black", linewidth = 0)) 
+    #panel.border =  element_rect(color='black'))
+p
+dev.off()
+
+#Fig S2b
+pdf("~/mouse_brain_alzheimer/figs2b.pdf",         # File name
+    width = 15 / 2.54 , height = 8 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+p <- DimPlot(immune,  group.by = "ident",  pt.size = 2, cols = colors, raster=TRUE) +#, label=TRUE, repel = TRUE ) + +
+  theme(
+    plot.title = element_blank(),
+    #legend.position = "none",
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"),
+    legend.text = element_text(family = "Helvetica", size = 6),
+    legend.key = element_rect(fill = "white"),#, colour = "white", linewidth = 0),
+    label.text = element_text(family = "Helvetica", size = 6),
+    )
+#LabelClusters(p, id="ident", repel = TRUE, family = "Helvetica", size = 2, color = "black")
+#p$layers[[1]]$aes_params$stroke <- 0
+#p$layers[[1]]$aes_params$size <- 4
+p
+dev.off()
+
+#Fig S2c
+pdf("~/mouse_brain_alzheimer/figs2c.pdf",         # File name
+    width = 8 / 2.54 , height = 10 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+ps<- list()
+for (gene in c("Vim", "Gsn", "Serpina3n", "Dkk3", "Calb2", "Penk")) {
+p <- FeaturePlot(object = immune, features = gene, pt.size=5, raster = TRUE) + 
+  theme(
+    plot.title = element_text(family = "Helvetica", size = 6, face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size =5, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    legend.text=element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.line = element_line(color = "black",linewidth = 0.25),
+    axis.ticks = element_line(color = "black",linewidth = 0.25),
+    legend.key.height= unit(0.1, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    legend.position = c (0.1,0.2),
+    )
+#p$layers[[1]]$aes_params$stroke <- 0
+#p$layers[[1]]$aes_params$size <- 0.1
+ps[[gene]]<- p
+}
+layout1<-"
+AB
+CD
+EF
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+
+#Fig S2d
+pdf("~/mouse_brain_alzheimer/figs2d.pdf",         # File name
+    width = 8 / 2.54 , height = 10 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+ps<- list()
+for (gene in c("C1qa", "C1qb", "C1qc", "Itgax", "Trem2", "Spp1")) {
+p <- FeaturePlot(object = immune, features = gene, pt.size=5, raster = TRUE) + 
+    theme(
+    plot.title = element_text(family = "Helvetica", size = 6, face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size =5, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    legend.text=element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.line = element_line(color = "black",linewidth = 0.25),
+    axis.ticks = element_line(color = "black",linewidth = 0.25),
+    #legend.key.height= unit(0.1, 'cm'),
+    #legend.key.width = unit(0.2, "cm"),
+    #legend.position = c (0.1,0.2),
+    legend.position = "none",
+    )
+#p$layers[[1]]$aes_params$stroke <- 0
+#p$layers[[1]]$aes_params$size <-1
+ps[[gene]]<- p
+}
+layout1<-"
+AB
+CD
+EF
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+
+
+```
+
+```{r}
+cat_factor <- "celltypes_manual_v1" 
+ma <- immune
+#rm(xenium.obj,xenium.obj.sel)
+```
+Convert cells to marked point pattern
+```{r}
+centroids <- ma[["fov"]]$centroids
+ma.maxx <- max(centroids$x)
+ma.maxy <-max(centroids$y)
+#the observation is controlled by the cell locations, not the IF image
+w <- owin(c(0,ma.maxx), c(0,ma.maxy), unitname=c("um", "ums"))
+z <- ppp(centroids$x, centroids$y, window = w) #, marks = colnames(ma))
+marks(z) <- data.frame(p_names = rownames(ma[[]]), cat = pull(ma[[]], cat_factor))
+```
+The original IF is first aligned in Xenium Explorer, from which a 3x3 alignment matrix is exported.
+This is in case the morphology and spatial transcriptomics object are not aligned, i.e same origin (0,0),
+scale and orientation.
+As per the Xenium alignment tutorial, the transformation matrix has translation, scaling, rotation, and reflection.
+The transformation value units are in pixels, and the image coordinates and its annotations are in microns. The (0,0) position is in the top left corner of the image.
+We use 'affine' from spatstat which takes a 2x2 matrix for rotation/reflection, and 2-values vector for translation. We then scale accounting for difference in original pixel sizes between the 2 images used for alignment.
+
+Original IF image 
+width : 15527 px (5046.08 um)
+height : 19540 px (6350.30 um)
+IFpxwidth = 0.3250
+IFpxheight = 0.3250
+
+Other ome files (same origin/scale as Xenium object)
+31348 px (6661.45 um)
+24864 px (5283.60 um)
+OMEpx width: 0.2125 um
+OMEpx height : 0.2125 um
+
+Save alignment file as "Xenium_V1_FFPE_TgCRND8_17_9_months_if_image_alignment_files/matrix.csv"
+```{r}
+alignment_matrix_file <- paste(workdir, "Xenium_V1_FFPE_TgCRND8_17_9_months_if_image_alignment_files/matrix.csv", sep="/")
+#alignment_mat <- c(-0.005620739234351479,1.5290391356596393,2166.8103540491984, 
+#                   -1.5290391356596393,	-0.005620739234351479,	22201.00617577853,
+#                   0,	0,	1)
+#align <- matrix(alignment_mat, ncol=3, byrow=TRUE)
+#
+IFpxwidth = 0.3250
+IFpxheight = 0.3250
+OMEpxwidth =  0.2125
+OMEpxheight = 0.2125
+
+align <- as.matrix(read.csv(alignment_matrix_file, header=F))
+aff <- align[c(1,2), c(1,2)]
+transx <- align[,3][1] * IFpxwidth
+transy <-  align[,3][2] * IFpxheight
+
+pt_geojson <- "~/mouse_brain_alzheimer/amyloid_expansion_30.geojson"
+# crs to specify geographic coordinates are in planar system not spheric (default)
+annotations_sf <- st_read(pt_geojson, crs = NA)
+geo <- st_geometry(annotations_sf) 
+windows <- lapply(geo, as.owin)
+df <- st_drop_geometry(annotations_sf)
+te <- tess(tiles=windows)
+marks(te) <- df
+te
+#plot(te, do.col = FALSE, do.labels = TRUE, main = "")
+#plot(te, values = marks(te)$name, main = "")
+
+reduction_factor <- 16
+xmin <- 0 #xmin <- te$window$xrange[1]
+xmax <- 15527 #xmax <- te$window$xrange[2]
+ymin <- 0 #ymin <- te$window$yrange[2]
+ymax <- 19540 #ymax <- te$window$yrange[2]
+
+morpho <- as.im(te, dimyx=c(xmax/reduction_factor, ymax/reduction_factor))
+#for some reason, we have to rescale twice. tried multiple combination incl. scaling by 1/OMEpxwidth to no avail
+plot(morpho, col=c('cyan', 'lightpink', 'white'), col.alpha=0.5)
+morpho <- rescale.im(morpho, 1/IFpxwidth, "ums")
+morpho <- affine(morpho, mat= aff, vec=c(transx, transy ))
+morpho <- rescale.im(morpho,IFpxwidth/OMEpxwidth, "ums")
+
+#check that the two plots align
+#plot(morpho, col=c('grey90', 'gray20', 'white'), col.alpha=0.5)
+#plot(z, pch=19, cex=0.1, alpha = 1, use.marks=FALSE, add=TRUE )
+#check that the two plots align
+palette = "Paired" 
+colors = brewer.pal(n=length(levels(as.factor(z$marks$cat))), name = palette)
+# Fig. 1D
+pdf("~/mouse_brain_alzheimer/fig1d.pdf",         # File name
+    width = 24 / 2.54 , height = 20 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+# run all 3 lines to create overlayed plots
+plot(z, pch=19, cex=0.05, alpha = 1, use.marks=TRUE, which.marks = "cat", cols = colors  , legend=TRUE, leg.side="left", leg.args=list(cex=2, nsymbols = length(colors)), show.window=FALSE) #
+plot(morpho, col=c('white', 'gray70', 'black'), col.alpha=0.5, ribbon=TRUE,  add=TRUE)
+plot(z, pch=19, cex=0.05, alpha = 1, use.marks=TRUE, which.marks = "cat"  , cols = colors, add=TRUE, show.window=FALSE)
+dev.off()
+```
+```{r}
+#Parameters setting
+map_type <- "areas"
+dist = 30
+if ( map_type == "sites"){
+  dist = 0
+}
+partitions_sel = c(1,3) # cells in 2 and out of window are removed
+min_coocs= 50
+iter_n <- 1000
+
+# initialize results dataframe
+uni_cat <- unique(z$marks$cat)
+r_g <- expand.grid(uni_cat, uni_cat, as.character(partitions_sel))
+ord_ct1 <- pmin(as.character(r_g$Var1), as.character(r_g$Var2))
+ord_ct2 <- pmax(as.character(r_g$Var1), as.character(r_g$Var2))
+ct_pairs <- paste(ord_ct1, ord_ct2, sep=" <-> ")
+r_g_theo <- data.frame(ct_pairs, ord_ct1, ord_ct2, r_g$Var3)
+r_g_theo <- r_g_theo %>% distinct()
+colnames(r_g_theo) <- c('ct_pairs', 'ord_ct1', 'ord_ct2', 'g')
+
+# collect partition area
+T_all <- partition_areas(morpho, partitions_sel, map_type)
+T_g <- T_all[[1]]
+rownames(T_g) <- as.character(rownames(T_g))
+r_g_theo$Tg <- T_g[as.character(r_g_theo$g)]
+
+# 1. get results for the actual data
+z_real <- z
+#sanity_check_structs(z_real, morpho, partitions_sel, dist)
+if (map_type == "areas") {
+  z_real <- select_points_in_partitions_areas(z_real, morpho, partitions_sel)
+}
+if (map_type == "sites") {
+  z_real <- select_points_in_partitions_sites(z_real, partitions_sel)
+}
+countpg <- count_coocurrences(z_real, dist)
+countpg$ct_pairs <- NULL
+names(countpg)[names(countpg) == 'n'] <- 'real.counts'
+r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+
+# 2. add the random permutations
+for (iter in 1:iter_n) {
+  print(iter)
+  z_shuf <- z
+  z_shuf$marks$cat <- sample(z_shuf$marks$cat)
+  # check where cells fall
+  #table(z_shuf$marks$marks.partition)/z_shuf$n
+  
+  #sanity_check_structs(z_shuf, morpho, partitions_sel, dist)
+  if (map_type == "areas") {
+    z_shuf <- select_points_in_partitions_areas(z_shuf, morpho, partitions_sel)
+  }
+  if (map_type == "sites") {
+    z_shuf <- select_points_in_partitions_sites(z_shuf, partitions_sel)
+  }
+  countpg <- count_coocurrences(z_shuf, dist)
+  countpg$ct_pairs <- NULL
+  names(countpg)[names(countpg) == 'n'] <- paste('rand', iter, sep="_")
+  r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+}
+
+#3. Save raw results from real data and permutation
+write.csv(r_g_theo, "~/mouse_brain_alzheimer/coocs_1000_permutations_v2.csv")
+```
+
+
+```{r}
+#r_g_theo <- read.csv("~/mouse_brain_alzheimer/coocs_1000_permutations_v2.csv") 
+
+
+#4. Convert to summary results
+reps <- c("real.counts", paste(sep="", "rand_", 1:iter_n)) 
+cols = c("ct_pairs", "ord_ct1", "ord_ct2", "g", "Tg")
+
+df <- data.frame(matrix(ncol = 2, nrow = 0))
+colnames(df) <- c('Hr_rel', 'rep')
+
+for (rep_sim in reps) {
+  print(rep_sim)
+  r_allg <- r_g_theo[,c(cols, rep_sim)]
+  ncoocs_by_ctpairs <- r_g_theo[,c(cols, rep_sim)] %>% # Count the total number of cells from each co-occurence (across all partitions)
+      replace(is.na(.), 0) %>% 
+      group_by(ct_pairs) %>% summarise(sum_n= sum(get(rep_sim)))
+  r_allg <- inner_join(r_allg, ncoocs_by_ctpairs, by="ct_pairs")
+  r_allg <- arrange(r_allg, ct_pairs, g)
+  r_all_g_fltr <-  prep_b4_calc_H(r_allg, rep_sim, min_coocs)
+  dec_H_rep <- counts_to_H(r_all_g_fltr, T_all)
+  r_all_g_fltr = dec_H_rep[[1]]
+  dec_H_r = dec_H_rep[[2]]
+  #store results from this rep in dataframe
+  df <- rbind(df, data.frame(Hr_rel = dec_H_r$Hr_rel, rep = rep_sim))
+  if (rep_sim == "real.counts"){ 
+    df.real.counts <- dec_H_rep
+  }
+}
+
+real.counts.ordered <- arrange(df.real.counts[[2]],Hr_rel)
+write.csv(real.counts.ordered, "~/mouse_brain_alzheimer/real.counts.Hr_rel_v2.csv")
+```
+
+```{r}
+T_star <- T_all[[2]]
+T_tot <- T_all[[3]]
+
+realcnts <- df.real.counts[[1]] %>% 
+  group_by(ct_pairs) %>% 
+  summarise(sum_n = sum(n), RCE = sum(plogtg_p), g1 = ifelse(g == 1, n, 0), g2 = ifelse(g == 2, n, 0), g3 = ifelse(g == 3, n, 0) ) %>%  
+  arrange(,RCE)
+realcnts <- realcnts %>%
+  group_by(ct_pairs) %>%
+  summarise(RCE = max(RCE), relRCE= (max(RCE) - log(T_star)) / (log(T_tot) - log(T_star)),
+            n = max(sum_n),  g1 = sum(g1), g2 = sum(g2), g3 = sum(g3) ) %>% 
+  arrange(,RCE)
+#Fig. 2B
+print(n=150, realcnts)
+```
+
+
+
+```{r}
+#real.counts.ordered <- read.csv("~/mouse_brain_alzheimer/real.counts.Hr_rel_v2.csv") 
+print(n=length(real.counts.ordered$ct_pairs), real.counts.ordered)
+
+df_by_rep <- df %>% group_by(rep) %>% summarise(mean_Hr_rel= mean(Hr_rel))
+df_by_rep$test <- with(df_by_rep, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+permutations <- df_by_rep[df_by_rep$test == "permutation test",]
+#df$test <- with(df, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+summary(permutations$mean_Hr_rel)
+var(permutations$mean_Hr_rel)
+
+#Fig 2a
+pdf("~/mouse_brain_alzheimer/fig2a.pdf",         # File name
+    width = 4 / 2.54 , height = 5 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+p <- ggplot(df_by_rep, aes(x=test, y=mean_Hr_rel)) + 
+  geom_boxplot(size = 0.5, colour="black", fill="white", linewidth = 0.5, outlier.size = 0.1) +
+  geom_jitter(size=0.1, alpha = 0.3) +
+  #theme(legend.position="none") +
+  #labs(title="Alzheimer Example") +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\ncell types","permuted\ncell types")) +
+  #coord_cartesian(ylim = c(0.91, 1)) +  
+  scale_y_continuous(name =  "Relative RCE", breaks=seq(0.91,0.99,0.01), limits=c(0.915, 0.999), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+
+
+#Fig. 2b
+print(n=length(real.counts.ordered$ct_pairs), real.counts.ordered)
+
+#Fig. S3a
+min(df[df$test == "permutation test",]$Hr_rel)
+#df$rep <- factor(df$rep , levels=reps)
+df$test <- with(df, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+pdf("~/mouse_brain_alzheimer/figs3a.pdf",         # File name
+    width = 4 / 2.54 , height = 5 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+library(ggforce)
+p <- ggplot(df, aes(x=test, y=Hr_rel, fill=test)) +   geom_violin() +
+  #geom_point(position = position_jitter(seed = 1, width = 0.2)) + 
+  geom_point(size = 0.5, fill="black", alpha=1) + 
+  geom_sina(alpha=0.01) +
+  #geom_jitter(position = position_jitter(seed = 1, width = 0.2)) +
+  theme(legend.position="none") +
+  #labs(title="Bird Example") +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\ncell types","permuted\ncell types")) +
+  #coord_cartesian(ylim = c(0.91, 1)) +  
+  scale_y_continuous(name =  "Relative RCE", breaks=seq(0.6,0.99,0.1), limits=c(0.5, 1), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+
+
+
+```
