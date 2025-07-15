@@ -7,20 +7,20 @@ Adnane Nemri(1,2), Ovidiu Radulescu(1), Antoine Claessens(1), Thomas D. Otto(1,2
 2. School of Infection & Immunity, University of Glasgow, United Kingdom
 
 Requires the following R libraries to run on the 2 example datasets:
-dplyr
-patchwork
-ggplot2
-scatterpie
-tidyr
-RColorBrewer
-ggforce
-scales
-sf
-SpatEntropy
-spatstat
-spAbundance
-Seurat
-clustree
+dplyr  
+patchwork  
+ggplot2  
+scatterpie  
+tidyr  
+RColorBrewer  
+ggforce  
+scales  
+sf  
+SpatEntropy  
+spatstat  
+spAbundance  
+Seurat  
+clustree  
 
 
 
