@@ -1,0 +1,563 @@
+```{r}
+library(dplyr)
+
+library(patchwork)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(scatterpie)
+
+library(tidyr)
+
+library(sf)
+library(SpatEntropy)
+library(spatstat)
+library(RColorBrewer)
+
+library(spAbundance)
+setwd( "~/birds_neon")
+
+SEED = 7
+set.seed(SEED)
+```
+Load functions
+Regional Co-occurence Entropy
+```{r}
+sanity_check_structs <- function(data, partition_map, partitions_sel, dist){
+    #0. Sanity checks
+    is.ppp(data) # returns TRUE
+    is.marked(data) # returns TRUE
+    if(spatstat.geom::is.ppp(data) & !spatstat.geom::is.marked(data) & length(table(data$marks$cat))==1)
+        stop("Data have only 1 category. Use Batty's entropy for this use case.")
+    is.list(partition_map) # returns TRUE if "areas" and FALSE if "sites"
+    is.im(partition_map) # returns TRUE if "areas" and FALSE if "sites"
+    if(spatstat.geom::area.owin(data$window)==1)
+          stop("Nemri's entropy cannot be computed on areas of total size = 1. You should change your measurement unit so that the window size is not 1.")
+}
+
+partition_areas <- function(map, regions, map_type){
+ # Get the area of each partition to table
+  # if pixel image, we count the pixels in each partition
+  if ( map_type == "areas") {
+    T_g <- table(map$v) # Area of each partition
+  }
+  #if sites, we count the sites
+  if ( map_type == "sites") {
+    print("map")
+    T_g <- table(map) # "Area" of each partition
+  }
+  T_g_sub <- T_g[regions] # in partitions_sel
+  T_star <- min(T_g_sub) # area of smallest partition
+  T_tot <- sum(T_g_sub) # total area of partitions in partitions_sel
+    
+  return(list(T_g, T_star, T_tot))
+}
+
+select_points_in_partitions_areas <- function(z, morpho, partitions_sel){
+    # Assign variables to function-to-be
+    # z has just one column
+    data <- z
+    partition_map <- morpho
+    # 1. Assign the cells to their partition based on the factor value for the pixel where they fall
+    cutdata <- cut(unmark(data), z=partition_map )
+    #table(cutdata$marks) #sanity check on the cell to partition attribution - before subsetting partition of interest
+    partition <- cutdata$marks
+    cutdata <- unmark(cutdata)
+    cutdata$marks$partition <- partition
+    cutdata$marks$cat <- data$marks$cat
+    cutdata$marks$p_names <- data$marks$p_names
+    cutdata <- subset(cutdata, partition %in% partitions_sel) # cells in 2 and out of window are removed
+    #table(cutdata$marks$marks.partition) #sanity check on the cell to partition attribution - after subsetting partition of interest
+
+    return(cutdata)
+}
+select_points_in_partitions_sites <- function(z, partitions_sel){
+    # z marks are 'p_names', 'cat' and 'partition
+    data <- z
+    cutdata <- subset(data, marks.partition %in% partitions_sel) 
+    return(cutdata)
+}
+
+
+count_coocurrences <- function(z, dist){
+  ## does not work for more than sqrt(.Machine$integer.max) = 46340 points
+  ## does not consider distances between 2 points, as long as their distance is less than dist
+    #library(Matrix)
+    
+    # Assign variables to function-to-be
+    # z has just one column
+    data <- z
+
+    ct <- as.vector(data$marks$marks.cat) # vector of the categories for all the points in partitions_sel
+    I = length(table(ct)) # total number of categories observed in partitions_sel
+    coocs_theo <- (I*I +I)/2 # maximum number of different possible co-occurences that could be observed for m=2
+    
+    # 2. calculate pseudo-adjacency matrix
+    eucl <- pairdist(data)  # matrix of pair-wise euclidian distances between cells
+    inradius <- (eucl <= dist) # matrix of pairs of cells at a distance less than threshold = pseudo-adjacency matrix (diagonal is 1)
+
+    #identify which pairs are in the same partition, and in which partition
+    # creates n-by-n matrix where intersections are either 0 (not in the same partition) or the partition number e.g 1, 2...(ID)
+    in_g <- data$marks$marks.partition
+    sameg <- outer(in_g, in_g, "==") # matrix of pairs of cells that fall in the same partition
+
+    # 3. Hadamard product of adjacency matrix and partition matrix 
+    # creates n-by-n matrix where intersections are either 0 (not in the same partition) or the partition number e.g 1, 2...(ID)
+    #ZLdg = eucl * inradius * sameg # turns diagonal into 0's
+    #is_cooc <- (ZLdg>0) # replace all pair-wise distances with 1's
+    ZLdg = inradius * sameg #ignore distances, gives diagonal of 1's
+    #plot(as.im(ZLdg), clipwin=owin(xrange= c(0,100), yrange=c(0,100)))
+    is_cooc <- ZLdg
+    is_cooc[lower.tri(is_cooc)] <- 0 # matrix is symmetrical so co-occurences are double counted as ind1-ind2 and ind2-ind1, remove lower triangle
+    is_cooc[diag(is_cooc)] <- 0 # remove diagonal to avoid counting self-links ind1-ind1
+    #sum(is_cooc) # check number of found- co-occurences
+    #plot(as.im(is_cooc), clipwin=owin(xrange= c(0,100), yrange=c(0,100)))
+    numing <- as.numeric(in_g)
+    whichg <- matrix(numing, nrow=length(numing), ncol=length(numing), byrow=TRUE)
+    cooc_byg <- is_cooc * whichg # puts the partition number (ID) where previously there was 1 indicating the 2 cells are in the same partition g
+    #plot(as.im(cooc_byg), clipwin=owin(xrange= c(0,100), yrange=c(0,100)))
+    
+    # 4. find the points in the partitions of interest and their marks
+    coocs <- which(cooc_byg != 0, arr.ind = T) #gives index position as row / col of all non-zero values in is_cooc 
+    ct1 <- ct[coocs[,1]] # position in row of all-vs-all matrix
+    ct2 <- ct[coocs[,2]] # position in column of all-vs-all matrix
+    ord_ct1 <- pmin(ct1, ct2)
+    ord_ct2 <- pmax(ct1, ct2)
+    ct_pairs <- paste(ord_ct1, ord_ct2, sep=" <-> ") # this is to order so that cat1-cat2 and cat2-cat1 both are counted as cat1-cat2
+    #table(ct_pairs) #check
+    
+    # 5. make a vector of partition ids for each non zero values in coocs_byg
+    cp <- as.vector(data$marks$marks.partition)
+    g <- cp[coocs[,1]] # position in row of all-vs-all matrix # (sum(g == cp[coocs[,2]]) == length(ct_pairs)) # Returns TRUE, no need to order
+    ct_pairs_byg <- data.frame(ct_pairs, ord_ct1, ord_ct2, g)
+    #print(ct_pairs_byg)
+    
+    count_p_g <- ct_pairs_byg %>%
+      group_by(ct_pairs,ord_ct1, ord_ct2,g) %>% summarize(n = n()) 
+    
+    return(count_p_g)
+}
+
+prep_b4_calc_H <- function(df, rep_sim, min_coocs){
+  
+  df["n"] <- df[rep_sim]
+  df[rep_sim] <- NULL
+  
+  #remove pairs that have no occurences across all g's
+  #start by identifying pairs with no occurences for safekeeping
+  df_miss <- df %>% filter(sum_n == 0)
+  nb_pairs_miss <- length(unique(df_miss$ct_pairs))
+  #print(nb_pairs_miss)
+  df <- df %>% filter(sum_n >0)
+  #print(df)
+  nb_pairs <- length(unique(df$ct_pairs))
+  #print(nb_pairs)
+  
+  # replace NA's by 0 to prepare to add 1
+  df$n[is.na(df$n)] <- 0
+ 
+  #identify edge case of pairs not occuring in at least one partition
+  undist <- df %>% filter( n == 0) 
+  uneven_pairs_ls <- unique(undist$ct_pairs)
+  #print(undist)
+  # add 1 to occurence to each partition where there the pair does not occur in at least one partition
+  df$n_mod <- df$n +  (df$ct_pairs %in% uneven_pairs_ls)
+  rm(undist, uneven_pairs_ls)
+  
+  # recalculate total occurences per pair
+  ncoocs_by_ctpairs <-  df[,c("ct_pairs", "n_mod")] %>% # Count the total number of cells from each co-occurence (across all partitions)
+      group_by(ct_pairs) %>% summarise(sum_n_mod= sum(n_mod))
+  df <- inner_join(df, ncoocs_by_ctpairs, by="ct_pairs")
+  
+  # remove pairs where total occurences less than set minimum
+  df <-  df %>% filter( sum_n_mod > min_coocs) 
+  
+  df["n"] <- df["n_mod"]
+  df["sum_n"] <- df["sum_n_mod"]
+  df["n_mod"] <- NULL
+  df["sum_n_mod"] <- NULL
+  
+  return(df)
+}
+
+counts_to_H <- function(df, T_all){
+
+    T_star <- T_all[[2]]
+    T_tot <- T_all[[3]]
+  
+    df$p = df$n / df$sum_n
+    df$plogtg_p = df$p * log(df$Tg / df$p)
+    
+    dec_H_r <- df %>%
+      group_by(ct_pairs) %>% summarise(Hr = sum(plogtg_p)) 
+    
+   # dec_H$n <- ncoocs_by_ctpairs$Cells_in_ct_pairs
+    dec_H_r$Hr_rel <- (dec_H_r$Hr - log(T_star)) / (log(T_tot) - log(T_star))
+    
+    #plot(dec_H_r$Hr_rel)
+    #summary(dec_H_r$Hr_rel)
+    
+    return(list(df, dec_H_r))
+}
+
+
+```
+
+90 sites with $coords$easting and $coords$northing (longitude, latitude)
+within a site all individuals have the same coordinates
+```{r}
+data(neonDWP)
+sp.names <- dimnames(neonDWP$y)[[1]]
+abundance_ac4dists <- rowSums(neonDWP$y, dims = 2) # the original matrix has a 3rd dimension with 4-dimensional arrays for the distance breaks, collapse
+sum(abundance_ac4dists) #753
+tr_ab <- t(abundance_ac4dists)
+
+easting <- neonDWP$coords[, "easting"]
+northing <- neonDWP$coords[, "northing"]
+forest <- neonDWP$covs$forest
+grass <- neonDWP$covs$grass
+tr_ab <- cbind(tr_ab, easting, northing, forest, grass)
+tr_ab <- as.data.frame(tr_ab)
+tr_ab$other_cover <- 1- tr_ab$forest - tr_ab$gras
+
+split_f = 1.75
+#environments must be stored as numbers
+envs <- matrix(c(1, 2, 3), ncol=3, byrow=TRUE)
+colnames(envs) <-  c("forest", "grass", "mixed")
+tr_ab$environment <- ifelse( tr_ab$forest > split_f * tr_ab$grass , envs[1], ifelse(tr_ab$grass > split_f * tr_ab$forest , envs[2], envs[3]))
+tr_ab$environment_n <- ifelse( tr_ab$forest > split_f * tr_ab$grass , "forest_dominant",  ifelse(tr_ab$grass > split_f * tr_ab$forest , "grass_dominant", "mixed_dominance"))
+#tr_ab$forest_dominant <- tr_ab$forest > 1.75 * tr_ab$grass
+
+pforest <- ggplot(neonDWP$covs, aes(x=wind, y=forest)) + geom_violin()  + geom_jitter(shape=16, position=position_jitter(0.2))
+pgrass  <- ggplot(neonDWP$covs, aes(x=wind, y=grass)) + geom_violin() + geom_jitter(shape=16, position=position_jitter(0.2))
+pforest + pgrass
+plot(neonDWP$covs$forest,neonDWP$covs$grass )
+min(neonDWP$coords[,"easting"])
+
+# Fig. S4cde
+pdf("~/birds_neon/figS4cde.pdf",         # File name
+    width = 20 / 2.54 , height = 20 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+ps<- list()
+ps[[1]]  <- ggplot() + geom_scatterpie(aes(x=easting, y=northing), data=tr_ab, cols = sp.names, 
+                                       pie_scale = 1.25, linewidth=0.1, ) + coord_equal() +
+  labs(title= "Species composition of sites", x = "Easting (meters)", y = "Northing (meters)")+
+  labs(fill = "Species") +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        #panel.grid.minor = element_blank()
+            plot.title = element_blank(),
+    #legend.position = "none",
+    legend.title = element_text(family = "Helvetica", size = 7),
+    legend.text = element_text(family = "Helvetica", size = 5),
+    legend.key = element_rect(fill = "white"),#, colour = "white", linewidth = 0),
+    legend.key.height= unit(0.2, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(fill = NA, colour="black", linewidth = 0.5),
+    panel.grid.major = element_line(colour="lightgrey", size=0.5),
+    panel.grid.minor = element_line(colour="lightgrey", size=0.25),
+    #legend.position = c (0.1,0.2),
+    #label.text = element_text(family = "Helvetica", size = 6),
+        ) +
+  theme(aspect.ratio=1.5)
+
+ps[[2]]  <- ggplot() + geom_scatterpie(aes(x=easting, y=northing), data=tr_ab, cols = c("forest", "grass", "other_cover"),
+                                       pie_scale = 1.25, linewidth=0.1, ) + coord_equal()  +
+  scale_fill_manual(values=c("chartreuse2", "gold", "grey80")) +
+  labs(x = "Easting (meters)", y = "Northing (meters)")+
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        #panel.grid.minor = element_blank()
+        legend.title = element_text(family = "Helvetica", size = 7),
+        legend.text = element_text(family = "Helvetica", size = 5),
+    legend.key = element_rect(fill = "white"),#, colour = "white", linewidth = 0),
+    legend.key.height= unit(0.2, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(fill = NA, colour="black", linewidth = 0.5),
+    panel.grid.major = element_line(colour="lightgrey", size=0.5),
+    panel.grid.minor = element_line(colour="lightgrey", size=0.25),
+        ) +
+  theme(aspect.ratio=1.5)
+
+ps[[3]] <- ggplot(tr_ab, aes(x=easting, y=northing, col = environment_n),
+                  ) + coord_equal() +
+  geom_point(size=2.5) +
+  labs(x = "Easting (meters)", y = "Northing (meters)") +
+    theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        #panel.grid.minor = element_blank()
+        legend.title = element_text(family = "Helvetica", size = 7),
+        legend.text = element_text(family = "Helvetica", size = 5),
+    legend.key = element_rect(fill = "white"),#, colour = "white", linewidth = 0),
+    legend.key.height= unit(0.2, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(fill = NA, colour="black", linewidth = 0.5),
+    panel.grid.major = element_line(colour="lightgrey", size=0.5),
+    panel.grid.minor = element_line(colour="lightgrey", size=0.25),
+        ) +
+  theme(aspect.ratio=1.5)
+
+layout1<-"
+A#
+BC
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+
+```
+
+Expand counts per site into individual points and convert to spatial point pattern
+Gives warning for duplicated points, which is expected behaviour for 'sites' data
+```{r}
+options(digits=16)
+#expand summary table to prepare data for spatial point pattern
+df <- data.frame(matrix(ncol = 6, nrow = 0))
+colnames(df) <- c('bird', 'species', 'site', 'easting', 'northing', 'environment')
+
+for( i in rownames(tr_ab) ) {
+  for ( j in sp.names ) {
+    count_sp_site = tr_ab[i,j]
+    if ( count_sp_site > 0 )
+      for (k in 1:count_sp_site){
+        indiv <- paste(j, i, k, sep="_")
+        row_add = c(indiv, j, i, tr_ab[i, 'easting'], tr_ab[i, 'northing'], tr_ab[i, "environment"])
+        df[nrow(df) + 1,] = row_add
+      }
+  }
+}
+df$easting <- as.numeric(df$easting)
+df$northing <- as.numeric(df$northing)
+df
+
+#Convert cells to marked point pattern
+win.minx <- min(df$easting)
+win.maxx <- max(df$easting)
+win.miny <- min(df$northing)
+win.maxy <- max(df$northing)
+
+#the observation is controlled by the cell locations, not the IF image
+w <- owin(c(win.minx,win.maxx), c(win.miny,win.maxy), unitname=c("meter", "meters"))
+z <- ppp(df$easting, df$northing, window = w)
+marks_df = df[,c('bird', 'species', 'environment')]
+colnames(marks_df) <- c('marks.p_names', 'marks.cat', 'marks.partition')
+marks(z) <- marks_df
+```
+
+
+```{r}
+# Parameters setting
+map_type <- "sites"
+if ( map_type == "sites"){
+  dist = 0
+}
+min_coocs= 3
+iter_n <- 1000 
+partitions_sel <- c(1, 2, 3)
+
+
+# initialize results dataframe 
+uni_cat <- unique(z$marks$marks.cat)
+r_g <- expand.grid(uni_cat, uni_cat, as.character(partitions_sel))
+ord_ct1 <- pmin(as.character(r_g$Var1), as.character(r_g$Var2))
+ord_ct2 <- pmax(as.character(r_g$Var1), as.character(r_g$Var2))
+ct_pairs <- paste(ord_ct1, ord_ct2, sep=" <-> ")
+r_g_theo <- data.frame(ct_pairs, ord_ct1, ord_ct2, r_g$Var3)
+r_g_theo <- r_g_theo %>% distinct()
+colnames(r_g_theo) <- c('ct_pairs', 'ord_ct1', 'ord_ct2', 'g')
+
+#####################################
+#in this case, the areas do not matter, as the birds are recorded for the whole site, with the center of the observation circle (radius 250m)
+#being recorded as coordinates for all the birds (overlapping points)
+#the area can then just be the number of sites of a given environment-type
+# collect partition area
+T_all <- partition_areas(tr_ab$environment, partitions_sel, map_type)
+T_g <- T_all[[1]]
+rownames(T_g) <- as.character(rownames(T_g))
+r_g_theo$Tg <- T_g[as.character(r_g_theo$g)]
+
+# 1. get counts for the actual data
+z_real <- z
+
+#sanity_check_structs(z_real, morpho, partitions_sel, dist) # TO DO add extra checks
+if (map_type == "areas") {
+  z_real <- select_points_in_partitions_areas(z_real, morpho, partitions_sel)
+}
+if (map_type == "sites") {
+  z_real <- select_points_in_partitions_sites(z_real, partitions_sel)
+}
+countpg <- count_coocurrences(z_real, dist)
+countpg$ct_pairs <- NULL
+names(countpg)[names(countpg) == 'n'] <- 'real.counts'
+r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+
+# 2. add the random permutations
+for (iter in 1:iter_n) {
+  print(iter)
+  z_shuf <- z
+  z_shuf$marks$marks.cat <- sample(z_shuf$marks$marks.cat)
+  # check where cells fall
+  table(z_shuf$marks$marks.partition)/z_shuf$n
+  
+  #sanity_check_structs(z_shuf, morpho, partitions_sel, dist) # TO DO add extra checks
+  if (map_type == "areas") {
+    z_shuf <- select_points_in_partitions_areas(z_shuf, morpho, partitions_sel)
+  }
+  if (map_type == "sites") {
+    z_shuf <- select_points_in_partitions_sites(z_shuf, partitions_sel)
+  }
+  countpg <- count_coocurrences(z_shuf,  dist)
+  countpg$ct_pairs <- NULL
+  names(countpg)[names(countpg) == 'n'] <- paste('rand', iter, sep="_")
+  r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+}
+
+write.csv(r_g_theo, "~/birds_neon/coocs_1000_permutations.csv")
+# the counts for the real data and the permutations are now saved
+```
+
+
+```{r}
+# Next step: calculate the entropies from the co-occurence counts
+#r_g_theo <- read.csv("~/birds_neon/coocs_1000_permutations.csv") 
+
+reps <- c("real.counts", paste(sep="", "rand_", 1:iter_n)) 
+cols = c("ct_pairs", "ord_ct1", "ord_ct2", "g", "Tg")
+
+df <- data.frame(matrix(ncol = 2, nrow = 0))
+colnames(df) <- c('Hr_rel', 'rep')
+
+for (rep_sim in reps) {
+  print(rep_sim)
+  r_allg <- r_g_theo[,c(cols, rep_sim)]
+  ncoocs_by_ctpairs <- r_g_theo[,c(cols, rep_sim)] %>% # Count the total number of cells from each co-occurence (across all partitions)
+      replace(is.na(.), 0) %>% 
+      group_by(ct_pairs) %>% summarise(sum_n= sum(get(rep_sim)))
+  r_allg <- inner_join(r_allg, ncoocs_by_ctpairs, by="ct_pairs")
+  r_allg <- arrange(r_allg, ct_pairs, g)
+  r_all_g_fltr <-  prep_b4_calc_H(r_allg, rep_sim, min_coocs)
+  dec_H_rep <- counts_to_H(r_all_g_fltr, T_all)
+  r_all_g_fltr = dec_H_rep[[1]]
+  dec_H_r = dec_H_rep[[2]]
+  #store results from this rep in dataframe
+  df <- rbind(df, data.frame(Hr_rel = dec_H_r$Hr_rel, rep = rep_sim))
+  if (rep_sim == "real.counts"){ 
+    df.real.counts <- dec_H_rep
+  }
+}
+
+real.counts.ordered <- arrange(df.real.counts[[2]],Hr_rel)
+write.csv(real.counts.ordered, "~/birds_neon/real.counts.Hr_rel.csv")
+
+write.csv(df.real.counts[[1]], "~/birds_neon/realcnts.csv")
+
+write.csv(df, "~/birds_neon/counts_real_perm.csv")
+```
+
+```{r}
+T_star <- T_all[[2]]
+T_tot <- T_all[[3]]
+
+realcnts_load <-read.csv("~/birds_neon/realcnts.csv")
+
+# Table S2 and fig 2d
+realcnts <- realcnts_load %>% 
+  group_by(ct_pairs) %>% 
+  summarise(sum_n = sum(n), RCE = sum(plogtg_p), g1 = ifelse(g == 1, n, 0), g2 = ifelse(g == 2, n, 0), g3 = ifelse(g == 3, n, 0) ) %>%  
+  arrange(,RCE)
+realcnts <- realcnts %>%
+  group_by(ct_pairs) %>%
+  summarise(RCE = max(RCE), relRCE= (max(RCE) - log(T_star)) / (log(T_tot) - log(T_star)),
+            n = max(sum_n),  g1 = sum(g1), g2 = sum(g2), g3 = sum(g3) ) %>% 
+  arrange(,RCE)
+print(n=150, realcnts)
+
+
+```
+
+```{r}
+library(scales)
+
+r_g_theo <- read.csv("~/birds_neon/coocs_100_permutations.csv")
+real.counts.ordered <- read.csv("~/birds_neon/real.counts.Hr_rel.csv")
+df <- read.csv("~/birds_neon/counts_real_perm.csv")
+
+#df$rep <- factor(df$rep , levels=reps)
+df$test <- with(df, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+df_by_rep <- df %>% group_by(rep) %>% summarise(mean_Hr_rel= mean(Hr_rel))
+df_by_rep$test <- with(df_by_rep, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+
+#Fig. 2C
+pdf("~/birds_neon/fig2c.pdf",         # File name
+    width = 4 / 2.54 , height = 5 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+p <- ggplot(df_by_rep, aes(x=test, y=mean_Hr_rel)) + 
+  geom_boxplot(size = 0.5, colour="black", fill="white", linewidth = 0.5, outlier.size = 0.1) +
+  geom_jitter(size=0.1, alpha = 0.3) +
+  #theme(legend.position="none") +
+  #labs(title="Bird Example") +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\nspecies","permuted\nspecies")) +
+  #coord_cartesian(ylim = c(0.91, 1)) +  
+  scale_y_continuous(name =  "Relative RCE", breaks=seq(0.91,0.99,0.01), limits=c(0.915, 0.999), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+# Fig. S3b
+pdf("~/birds_neon/figS3b.pdf",         # File name
+    width = 4 / 2.54 , height = 5 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",          # Background color
+    colormodel = "cmyk",    # Color model (cmyk is required for most publications)
+    paper = "A4")          # Paper size
+library(ggforce)
+p <- ggplot(df, aes(x=test, y=Hr_rel, fill=test)) +   geom_violin() +
+  #geom_point(position = position_jitter(seed = 1, width = 0.2)) + 
+  geom_point(size = 0.1, fill="black", alpha=0.1) + 
+  geom_sina(alpha=0.01) +
+  #geom_jitter(position = position_jitter(seed = 1, width = 0.2)) +
+  theme(legend.position="none") +
+  #labs(title="Bird Example") +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\nspecies","permuted\nspecies")) +
+  #coord_cartesian(ylim = c(0.91, 1)) +  
+  scale_y_continuous(name =  "Relative RCE", breaks=seq(0.6,0.99,0.1), limits=c(0.5, 1), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+
+
+
+
+#print(n=length(real.counts.ordered$ct_pairs), real.counts.ordered)
+
+
+#ggsave(file="~/birds_neon/fig2c.svg", plot=p, width=4, height=5, units = "cm")
+ 
+```
+
+
+
