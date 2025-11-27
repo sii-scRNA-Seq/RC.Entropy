@@ -1,0 +1,314 @@
+---
+title: "village_example"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{village_example}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(dplyr)
+library(sf)
+library(spatstat)
+
+library(RC.entropy)
+
+SEED = 7
+set.seed(SEED)
+```
+
+Create work directory
+```{r}
+workdir <- "~/dennery_drone"
+
+if (!dir.exists(workdir)){
+  dir.create(workdir)
+}else{
+  print("dir exists")
+}
+#setwd(workdir) # this breaks knitr during devtools::check()
+```
+
+/// FORMAT CONVERSION 1/2 FROM CENTROIDS GEOSON TO SPATIAL POINT PATTERN 
+
+Generate spatial point pattern (z) and partition map (morpho). 
+
+```{r}
+# 1. load partitions and convert to pixel image
+g_geojson <- paste(workdir, "area_blocks_epsg3857.geojson", sep="/")
+g_sf <- st_read(g_geojson, crs = NA) # crs to specify geographic coordinates are in planar system not spheric (default)
+p <- g_sf[2]
+plot(p)
+win <- st_bbox(p)
+#one polygon is empty, remove it
+pne <- p %>% filter(!st_is_empty(.))
+geo <- st_geometry(pne) 
+windows <- lapply(geo, as.owin)
+df <- st_drop_geometry(pne)
+te <- tess(tiles=windows)
+marks(te) <- df
+reduction_factor <- 2
+xmin <- te$window$xrange[1]
+xmax <- te$window$xrange[2]
+ymin <- te$window$yrange[1]
+ymax <- te$window$yrange[2]
+morpho <- as.im(te, dimyx=c((xmax-xmin)/reduction_factor, (ymax-ymin)/reduction_factor))
+
+# 2. load buildings and convert to spatial point pattern
+cat_factor <- "ROOF_MATERIAL"
+pt_geojson <- paste(workdir, "dennery_centroids.geojson", sep="/")
+annotations_sf <- st_read(pt_geojson, crs = NA) # crs to specify geographic coordinates are in planar system not spheric (default)
+z <- as.ppp(annotations_sf)
+z$window <- te$window
+marks(z) <- data.frame(p_names = rownames(z$marks), cat = pull(z$marks, cat_factor))
+
+# 3. check that the two plots align
+z_palette = "Set1" 
+z_colors = brewer.pal(n=length(levels(as.factor(z$marks$cat))), name = z_palette)
+m_palette = "Pastel1"
+m_colors = brewer.pal(n=length(levels(as.factor(morpho$v))), name = m_palette)
+# Fig. X1
+pdf(paste(workdir, "figX1.pdf", sep = "/"),       
+    width = 24 / 2.54 , height = 20 / 2.54, 
+    bg = "white", 
+    colormodel = "cmyk", 
+    paper = "A4") 
+# run all 3 lines to create overlayed plots
+plot(z, pch=19, cex=0.05, alpha = 1, use.marks=TRUE, which.marks = "cat", cols = z_colors  , legend=TRUE, leg.side="left", leg.args=list(cex=2, nsymbols = length(z_colors)), show.window=FALSE) #
+plot(morpho, col=m_colors, col.alpha=0.5, ribbon=TRUE,  add=TRUE)
+plot(z, pch=19, cex=0.05, alpha = 1, use.marks=TRUE, which.marks = "cat"  , cols = z_colors, add=TRUE, show.window=FALSE)
+dev.off() 
+ 
+
+```
+
+```{r}
+# cat 1
+conditions <- c("BLUE_TARP", "CONCRETE_CEMENT", "HEALTHY_METAL")
+replacement_values <- c("intact", "intact", "intact", "intact")
+z$marks$cat2 <- replace(z$marks$cat, z$marks$cat %in% conditions, replacement_values)
+# cat 2
+conditions <- c("INCOMPLETE", "IRREGULAR_METAL")
+replacement_values <- c("damaged", "damaged")
+z$marks$cat <- replace(z$marks$cat2, z$marks$cat2 %in% conditions, replacement_values)
+z$marks$cat2 <- NULL
+
+#check frequencies of the different categories (not split by partitions)
+table(z$marks$cat)
+```
+/// REGIONAL CO-OCCURENCE ENTROPY workflow starts here
+```{r}
+#Parameters setting
+map_type <- "areas" # alternative is: "sites"
+dist = 15 # this is the parameter "d"
+if ( map_type == "sites"){
+  dist = 0
+  morpho <- NULL
+}
+partitions_sel = c(1,2,3,4,5,6) # see block above where morpho is plotted to select regions of interest
+min_coocs= 10
+iter_n <- 1000 # number of random permutations of labels to run 
+
+# initialize results dataframe
+uni_cat <- unique(z$marks$cat)
+r_g <- expand.grid(uni_cat, uni_cat, as.character(partitions_sel))
+ord_ct1 <- pmin(as.character(r_g$Var1), as.character(r_g$Var2))
+ord_ct2 <- pmax(as.character(r_g$Var1), as.character(r_g$Var2))
+ct_pairs <- paste(ord_ct1, ord_ct2, sep=" <-> ")
+r_g_theo <- data.frame(ct_pairs, ord_ct1, ord_ct2, r_g$Var3)
+r_g_theo <- r_g_theo %>% distinct()
+colnames(r_g_theo) <- c('ct_pairs', 'ord_ct1', 'ord_ct2', 'g')
+
+# collect partition area information
+T_all <- partition_areas(morpho, partitions_sel, map_type)
+T_g <- T_all[[1]]
+rownames(T_g) <- as.character(rownames(T_g))
+r_g_theo$Tg <- T_g[as.character(r_g_theo$g)]
+
+# 1. get results for the actual data - you may want to stop there if you are not interested in testing permutations
+z_real <- z
+#sanity_check_structs(z_real, morpho, partitions_sel, dist) #perform sanity checks, TO DO properly
+if (map_type == "areas") {
+  z_real <- select_points_in_partitions_areas(z_real, morpho, partitions_sel)
+}
+if (map_type == "sites") {
+  z_real <- select_points_in_partitions_sites(z_real, partitions_sel)
+}
+# check distribution of categories across partitions
+table(z_real$marks$marks.partition, z_real$marks$marks.cat)
+
+countpg <- count_coocurrences(z_real, dist)
+countpg$ct_pairs <- NULL
+names(countpg)[names(countpg) == 'n'] <- 'real.counts'
+r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+
+# 2. add the random permutations
+for (iter in 1:iter_n) {
+  print(iter)
+  z_shuf <- z
+  z_shuf$marks$cat <- sample(z_shuf$marks$cat)
+  # check where buildings fall
+  #table(z_shuf$marks$marks.partition)/z_shuf$n
+  
+  #sanity_check_structs(z_shuf, morpho, partitions_sel, dist)
+  if (map_type == "areas") {
+    z_shuf <- select_points_in_partitions_areas(z_shuf, morpho, partitions_sel)
+  }
+  if (map_type == "sites") {
+    z_shuf <- select_points_in_partitions_sites(z_shuf, partitions_sel)
+  }
+  countpg <- count_coocurrences(z_shuf, dist)
+  countpg$ct_pairs <- NULL
+  names(countpg)[names(countpg) == 'n'] <- paste('rand', iter, sep="_")
+  r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+}
+
+#3. Save raw results from real data and permutation
+perm <- paste("coocs",iter_n, "permutations.csv", sep="_")
+write.csv(r_g_theo, paste(workdir, perm, sep="/"))
+```
+
+Checkpoint after iterations
+
+```{r}
+# Uncomment this line if you have already the time-consuming step if iterations of random permutations
+#r_g_theo <- read.csv( paste(workdir, perm, sep="/")) 
+
+#4. Convert to summary results
+reps <- c("real.counts", paste(sep="", "rand_", 1:iter_n)) 
+cols = c("ct_pairs", "ord_ct1", "ord_ct2", "g", "Tg")
+
+df <- data.frame(matrix(ncol = 2, nrow = 0))
+colnames(df) <- c('Hr_rel', 'rep')
+
+for (rep_sim in reps) {
+  print(rep_sim)
+  r_allg <- r_g_theo[,c(cols, rep_sim)]
+  ncoocs_by_ctpairs <- r_g_theo[,c(cols, rep_sim)] %>% # Count the total number of buildings from each co-occurence (across all partitions)
+      replace(is.na(.), 0) %>% 
+      group_by(ct_pairs) %>% summarise(sum_n= sum(get(rep_sim)))
+  r_allg <- inner_join(r_allg, ncoocs_by_ctpairs, by="ct_pairs")
+  r_allg <- arrange(r_allg, ct_pairs, g)
+  r_all_g_fltr <-  prep_b4_calc_H(r_allg, rep_sim, min_coocs)
+  dec_H_rep <- counts_to_H(r_all_g_fltr, T_all)
+  r_all_g_fltr = dec_H_rep[[1]]
+  dec_H_r = dec_H_rep[[2]]
+  #store results from this rep in dataframe
+  df <- rbind(df, data.frame(Hr_rel = dec_H_r$Hr_rel, rep = rep_sim))
+  if (rep_sim == "real.counts"){ 
+    df.real.counts <- dec_H_rep
+  }
+}
+
+real.counts.ordered <- arrange(df.real.counts[[2]],Hr_rel)
+write.csv(real.counts.ordered,  paste(workdir, "real.counts.Hr_rel.csv", sep="/"))
+```
+
+Decomposed RCE's
+Sort by lowest (most signal) to highest (lowest signal=random) and display just the top pairs
+```{r}
+T_star <- T_all[[2]]
+T_tot <- T_all[[3]]
+
+realcnts <- df.real.counts[[1]] %>% 
+  group_by(ct_pairs) %>% 
+  summarise(sum_n = sum(n), RCE = sum(plogtg_p), 
+            g1 = ifelse(g == 1, n, 0), 
+            g2 = ifelse(g == 2, n, 0), 
+            g3 = ifelse(g == 3, n, 0),
+            g4 = ifelse(g == 4, n, 0),
+            g5 = ifelse(g == 5, n, 0),
+            g6 = ifelse(g == 6, n, 0),) %>%  
+  arrange(,RCE)
+realcnts <- realcnts %>%
+  group_by(ct_pairs) %>%
+  summarise(RCE = max(RCE), relRCE= (max(RCE) - log(T_star)) / (log(T_tot) - log(T_star)),
+            n = max(sum_n),  
+            g1 = sum(g1), 
+            g2 = sum(g2), 
+            g3 = sum(g3),
+            g4 = sum(g4),
+            g5 = sum(g5),
+            g6 = sum(g6)
+            ) %>% 
+  arrange(,RCE)
+#Fig. 2d
+print(n=150, realcnts)
+```
+
+Summary statistics of permutations
+Plotting of permutations against real data averaged per iteration (fig X3) and with each decomposed RCE (fig X4)
+Decomposed RCE's of pairs (fig X5)
+
+```{r}
+print(n=length(real.counts.ordered$ct_pairs), real.counts.ordered)
+
+df_by_rep <- df %>% group_by(rep) %>% summarise(mean_Hr_rel= mean(Hr_rel))
+df_by_rep$test <- with(df_by_rep, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+permutations <- df_by_rep[df_by_rep$test == "permutation test",]
+
+summary(permutations$mean_Hr_rel)
+var(permutations$mean_Hr_rel)
+
+#Fig 2b
+pdf(paste(workdir, "fig2b.pdf", sep = "/"),
+    width = 4 / 2.54 , height = 5 / 2.54,
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4")
+p <- ggplot(df_by_rep, aes(x=test, y=mean_Hr_rel)) + 
+  geom_boxplot(size = 0.5, colour="black", fill="white", linewidth = 0.5, outlier.size = 0.1) +
+  geom_jitter(size=0.1, alpha = 0.3) +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\nrooftypes","permuted\nrooftypes")) +
+  scale_y_continuous(name =  "Relative RCE", breaks=seq(0.88,0.99,0.02), limits=c(0.885, 0.999), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+
+#Fig. 2d
+print(n=length(real.counts.ordered$ct_pairs), real.counts.ordered)
+
+#Fig. 2c
+min(df[df$test == "permutation test",]$Hr_rel)
+df$test <- with(df, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+pdf(paste(workdir, "fig2c.pdf", sep = "/"),
+    width = 4 / 2.54 , height = 5 / 2.54,
+    bg = "white",
+    colormodel = "cmyk", 
+    paper = "A4") 
+p <- ggplot(df, aes(x=test, y=Hr_rel, fill=test)) +   geom_violin() +
+  geom_point(size = 0.5, fill="black", alpha=1) + 
+  geom_sina(alpha=0.01) +
+  theme(legend.position="none") +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\nrooftypes","permuted\nrooftypes")) +
+  scale_y_continuous(name =  "Decomposed relative RCE", breaks=seq(0.6,0.99,0.1), limits=c(0.5, 1), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+
+
+```
+
+
