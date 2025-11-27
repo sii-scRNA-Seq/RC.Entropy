@@ -1,0 +1,34 @@
+Package: RC.entropy
+Title: Calculation of Regional Co-Occurence Entropy (RCE) for spatial point patterns
+Version: 0.9
+Authors@R: 
+    c(
+    person(
+      given = "Adnane", 
+      family = "Nemri", 
+      email= c("adnane.nemri@umontpellier.fr", "adnane.nemri@protonmail.com"), 
+      role = c("aut"), 
+      comment = c(ORCID = "0009-0007-9842-3851")
+      ),
+    person(
+      given = "Thomas", 
+      family = "Otto", 
+      email= "thomas.otto@bnitm.de", 
+      role = c("ctb", "cre"), 
+      comment = c(ORCID = "0000-0002-1246-7404")
+      ))
+Description: A spatial entropy measure that detects when categorical co-occurrences happen preferentially in specific environments. To run, users provide a spatial point pattern of individuals (cells, buildings…) labelled as categories. They also provide a map indicating the partitions as well as a selection of the partitions of interest (partition_sel ). There are 2 other user-chosen parameters input, which must be adapted to the data at hand. These include d, the maximum distance between two points to consider them co-occurrent; and min_coocs, the minimum count of a specific co-occurence pair to include it in the analysis. It takes as input a spatial point pattern of categorical data and partition information. The algorithm returns tables with decomposed RCE and the overall RCE.
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Imports:
+    dplyr,
+    spatstat.geom,
+    magrittr
+License: GPL (>= 3)
+Suggests: 
+    knitr,
+    rmarkdown,
+    sf
+VignetteBuilder: 
+    knitr

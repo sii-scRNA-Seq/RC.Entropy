@@ -1,0 +1,396 @@
+---
+title: "birds_example"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{birds_example}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(dplyr)
+library(ggforce)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(patchwork)
+library(RColorBrewer)
+library(scales)
+library(scatterpie)
+library(sf)
+library(spatstat)
+library(tidyr)
+
+library(RC.entropy)
+
+library(spAbundance)
+
+SEED = 7
+set.seed(SEED)
+```
+
+Create work directory
+```{r}
+workdir <- "~/birds_neon_v2"
+
+if (!dir.exists(workdir)){
+  dir.create(workdir)
+}else{
+  print("dir exists")
+}
+#setwd(workdir) # this breaks knitr during devtools::check()
+```
+
+90 sites with $coords$easting and $coords$northing (longitude, latitude)
+within a site all individuals have the same coordinates, we set map_type = "sites"  causing dist = 0
+```{r}
+
+
+data(neonDWP)
+sp.names <- dimnames(neonDWP$y)[[1]]
+abundance_ac4dists <- rowSums(neonDWP$y, dims = 2) # the original matrix has a 3rd dimension with 4-dimensional arrays for the distance breaks, collapse
+sum(abundance_ac4dists) #753
+tr_ab <- t(abundance_ac4dists)
+
+easting <- neonDWP$coords[, "easting"]
+northing <- neonDWP$coords[, "northing"]
+forest <- neonDWP$covs$forest
+grass <- neonDWP$covs$grass
+tr_ab <- cbind(tr_ab, easting, northing, forest, grass)
+tr_ab <- as.data.frame(tr_ab)
+tr_ab$other_cover <- 1- tr_ab$forest - tr_ab$gras
+
+split_f = 1.75
+#environments must be stored as numbers
+envs <- matrix(c(1, 2, 3), ncol=3, byrow=TRUE)
+colnames(envs) <-  c("forest", "grass", "mixed")
+tr_ab$environment <- ifelse( tr_ab$forest > split_f * tr_ab$grass , envs[1], ifelse(tr_ab$grass > split_f * tr_ab$forest , envs[2], envs[3]))
+tr_ab$environment_n <- ifelse( tr_ab$forest > split_f * tr_ab$grass , "forest_dominant",  ifelse(tr_ab$grass > split_f * tr_ab$forest , "grass_dominant", "mixed_dominance"))
+#tr_ab$forest_dominant <- tr_ab$forest > 1.75 * tr_ab$grass
+
+pforest <- ggplot(neonDWP$covs, aes(x=wind, y=forest)) + geom_violin()  + geom_jitter(shape=16, position=position_jitter(0.2))
+pgrass  <- ggplot(neonDWP$covs, aes(x=wind, y=grass)) + geom_violin() + geom_jitter(shape=16, position=position_jitter(0.2))
+pforest + pgrass
+plot(neonDWP$covs$forest,neonDWP$covs$grass )
+min(neonDWP$coords[,"easting"])
+
+# Fig. 3ab and s4
+pdf(paste(workdir, "fig3a_s4.pdf", sep = "/"),
+    width = 20 / 2.54 , height = 20 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4")
+ps<- list()
+ps[[1]]  <- ggplot() + geom_scatterpie(aes(x=easting, y=northing), data=tr_ab, cols = sp.names, 
+                                       pie_scale = 1.25, linewidth=0.1, ) + coord_equal() +
+  labs(title= "Species composition of sites", x = "Easting (meters)", y = "Northing (meters)") +
+  labs(fill = "Species") +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        plot.title = element_blank(),
+        legend.title = element_text(family = "Helvetica", size = 7),
+        legend.text = element_text(family = "Helvetica", size = 5),
+        legend.key = element_rect(fill = "white"),
+        legend.key.height= unit(0.2, 'cm'),
+        legend.key.width = unit(0.2, "cm"),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_rect(fill = NA, colour="black", linewidth = 0.5),
+        panel.grid.major = element_line(colour="lightgrey", size=0.5),
+        panel.grid.minor = element_line(colour="lightgrey", size=0.25),
+        ) +
+  theme(aspect.ratio=1.5)
+
+ps[[2]]  <- ggplot() + geom_scatterpie(aes(x=easting, y=northing), data=tr_ab, cols = c("forest", "grass", "other_cover"),
+                                       pie_scale = 1.25, linewidth=0.1, ) + coord_equal()  +
+  scale_fill_manual(values=c("chartreuse2", "gold", "grey80")) +
+  labs(x = "Easting (meters)", y = "Northing (meters)")+
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        #panel.grid.minor = element_blank()
+        legend.title = element_text(family = "Helvetica", size = 7),
+        legend.text = element_text(family = "Helvetica", size = 5),
+    legend.key = element_rect(fill = "white"),#, colour = "white", linewidth = 0),
+    legend.key.height= unit(0.2, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(fill = NA, colour="black", linewidth = 0.5),
+    panel.grid.major = element_line(colour="lightgrey", size=0.5),
+    panel.grid.minor = element_line(colour="lightgrey", size=0.25),
+        ) +
+  theme(aspect.ratio=1.5)
+
+ps[[3]] <- ggplot(tr_ab, aes(x=easting, y=northing, col = environment_n),
+                  ) + coord_equal() +
+  geom_point(size=2.5) +
+  labs(x = "Easting (meters)", y = "Northing (meters)") +
+    theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        #panel.grid.minor = element_blank()
+        legend.title = element_text(family = "Helvetica", size = 7),
+        legend.text = element_text(family = "Helvetica", size = 5),
+    legend.key = element_rect(fill = "white"),#, colour = "white", linewidth = 0),
+    legend.key.height= unit(0.2, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    panel.background = element_rect(fill = "white"),
+    panel.border = element_rect(fill = NA, colour="black", linewidth = 0.5),
+    panel.grid.major = element_line(colour="lightgrey", size=0.5),
+    panel.grid.minor = element_line(colour="lightgrey", size=0.25),
+        ) +
+  theme(aspect.ratio=1.5)
+
+layout1<-"
+A#
+BC
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+
+```
+
+
+Expand counts per site into individual points and convert to spatial point pattern
+Gives warning for duplicated points, which is expected behaviour for 'sites' data
+```{r}
+options(digits=16)
+#expand summary table to prepare data for spatial point pattern
+df <- data.frame(matrix(ncol = 6, nrow = 0))
+colnames(df) <- c('bird', 'species', 'site', 'easting', 'northing', 'environment')
+
+for( i in rownames(tr_ab) ) {
+  for ( j in sp.names ) {
+    count_sp_site = tr_ab[i,j]
+    if ( count_sp_site > 0 )
+      for (k in 1:count_sp_site){
+        indiv <- paste(j, i, k, sep="_")
+        row_add = c(indiv, j, i, tr_ab[i, 'easting'], tr_ab[i, 'northing'], tr_ab[i, "environment"])
+        df[nrow(df) + 1,] = row_add
+      }
+  }
+}
+df$easting <- as.numeric(df$easting)
+df$northing <- as.numeric(df$northing)
+df
+
+#Convert cells to marked point pattern
+win.minx <- min(df$easting)
+win.maxx <- max(df$easting)
+win.miny <- min(df$northing)
+win.maxy <- max(df$northing)
+
+w <- owin(c(win.minx,win.maxx), c(win.miny,win.maxy), unitname=c("meter", "meters"))
+z <- ppp(df$easting, df$northing, window = w)
+marks_df = df[,c('bird', 'species', 'environment')]
+colnames(marks_df) <- c('marks.p_names', 'marks.cat', 'marks.partition')
+marks(z) <- marks_df
+```
+
+/// REGIONAL CO-OCCURENCE ENTROPY workflow starts here
+
+```{r}
+# Parameters setting
+map_type <- "sites"
+if ( map_type == "sites"){
+  dist = 0
+  morpho <- NULL
+}
+min_coocs= 3
+iter_n <- 1000
+partitions_sel <- c(1, 2, 3)
+
+
+# initialize results dataframe 
+uni_cat <- unique(z$marks$marks.cat)
+r_g <- expand.grid(uni_cat, uni_cat, as.character(partitions_sel))
+ord_ct1 <- pmin(as.character(r_g$Var1), as.character(r_g$Var2))
+ord_ct2 <- pmax(as.character(r_g$Var1), as.character(r_g$Var2))
+ct_pairs <- paste(ord_ct1, ord_ct2, sep=" <-> ")
+r_g_theo <- data.frame(ct_pairs, ord_ct1, ord_ct2, r_g$Var3)
+r_g_theo <- r_g_theo %>% distinct()
+colnames(r_g_theo) <- c('ct_pairs', 'ord_ct1', 'ord_ct2', 'g')
+
+#####################################
+#in this case, the areas do not matter, as the birds are recorded for the whole site, with the center of the observation circle (radius 250m)
+#being recorded as coordinates for all the birds (overlapping points)
+#the area can then just be the number of sites of a given environment-type
+# collect partition area
+T_all <- partition_areas(tr_ab$environment, partitions_sel, map_type)
+T_g <- T_all[[1]]
+rownames(T_g) <- as.character(rownames(T_g))
+r_g_theo$Tg <- T_g[as.character(r_g_theo$g)]
+
+# 1. get counts for the actual data
+z_real <- z
+
+#sanity_check_structs(z_real, morpho, partitions_sel, dist) # TO DO add extra checks
+if (map_type == "areas") {
+  z_real <- select_points_in_partitions_areas(z_real, morpho, partitions_sel)
+}
+if (map_type == "sites") {
+  z_real <- select_points_in_partitions_sites(z_real, partitions_sel)
+}
+countpg <- count_coocurrences(z_real, dist)
+countpg$ct_pairs <- NULL
+names(countpg)[names(countpg) == 'n'] <- 'real.counts'
+r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+
+# 2. add the random permutations
+for (iter in 1:iter_n) {
+  print(iter)
+  z_shuf <- z
+  z_shuf$marks$marks.cat <- sample(z_shuf$marks$marks.cat)
+  # check where birds fall
+  table(z_shuf$marks$marks.partition)/z_shuf$n
+  
+  #sanity_check_structs(z_shuf, morpho, partitions_sel, dist) # TO DO add extra checks
+  if (map_type == "areas") {
+    z_shuf <- select_points_in_partitions_areas(z_shuf, morpho, partitions_sel)
+  }
+  if (map_type == "sites") {
+    z_shuf <- select_points_in_partitions_sites(z_shuf, partitions_sel)
+  }
+  countpg <- count_coocurrences(z_shuf,  dist)
+  countpg$ct_pairs <- NULL
+  names(countpg)[names(countpg) == 'n'] <- paste('rand', iter, sep="_")
+  r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+}
+
+#3. Save raw results from real data and permutation
+perm <- paste("coocs",iter_n, "permutations.csv", sep="_")
+write.csv(r_g_theo, paste(workdir, perm, sep="/"))
+
+```
+
+Checkpoint after iterations
+
+```{r}
+# Uncomment this line if you have already done the time-consuming step of iterations of random permutations
+#r_g_theo <- read.csv( paste(workdir, perm, sep="/"))
+
+#4. Convert to summary results
+reps <- c("real.counts", paste(sep="", "rand_", 1:iter_n)) 
+cols = c("ct_pairs", "ord_ct1", "ord_ct2", "g", "Tg")
+
+df <- data.frame(matrix(ncol = 2, nrow = 0))
+colnames(df) <- c('Hr_rel', 'rep')
+
+for (rep_sim in reps) {
+  print(rep_sim)
+  r_allg <- r_g_theo[,c(cols, rep_sim)]
+  ncoocs_by_ctpairs <- r_g_theo[,c(cols, rep_sim)] %>% # Count the total number of cells from each co-occurence (across all partitions)
+      replace(is.na(.), 0) %>% 
+      group_by(ct_pairs) %>% summarise(sum_n= sum(get(rep_sim)))
+  r_allg <- inner_join(r_allg, ncoocs_by_ctpairs, by="ct_pairs")
+  r_allg <- arrange(r_allg, ct_pairs, g)
+  r_all_g_fltr <-  prep_b4_calc_H(r_allg, rep_sim, min_coocs)
+  dec_H_rep <- counts_to_H(r_all_g_fltr, T_all)
+  r_all_g_fltr = dec_H_rep[[1]]
+  dec_H_r = dec_H_rep[[2]]
+  #store results from this rep in dataframe
+  df <- rbind(df, data.frame(Hr_rel = dec_H_r$Hr_rel, rep = rep_sim))
+  if (rep_sim == "real.counts"){ 
+    df.real.counts <- dec_H_rep
+  }
+}
+
+real.counts.ordered <- arrange(df.real.counts[[2]],Hr_rel)
+write.csv(real.counts.ordered,  paste(workdir, "real.counts.Hr_rel.csv", sep="/"))
+
+```
+
+Decomposed RCE's
+Sort by lowest (most signal) to highest (lowest signal=random) and display just the top pairs
+
+```{r}
+T_star <- T_all[[2]]
+T_tot <- T_all[[3]]
+
+realcnts <- df.real.counts[[1]]  %>% 
+  group_by(ct_pairs) %>% 
+  summarise(sum_n = sum(n), RCE = sum(plogtg_p), g1 = ifelse(g == 1, n, 0), g2 = ifelse(g == 2, n, 0), g3 = ifelse(g == 3, n, 0) ) %>%  
+  arrange(,RCE)
+realcnts <- realcnts %>%
+  group_by(ct_pairs) %>%
+  summarise(RCE = max(RCE), relRCE= (max(RCE) - log(T_star)) / (log(T_tot) - log(T_star)),
+            n = max(sum_n),  g1 = sum(g1), g2 = sum(g2), g3 = sum(g3) ) %>% 
+  arrange(,RCE)
+#fig 2d (and table s2)
+print(n=150, realcnts)
+
+
+```
+Summary statistics of permutations
+Plotting of permutations against real data averaged per iteration (fig 2c) and with each decomposed RCE (fig s3b)
+Decomposed RCE's of pairs (fig ??)
+
+```{r}
+# Uncomment this line if you have already the time-consuming step if iterations of random permutations
+#r_g_theo <- read.csv( paste(workdir, perm, sep="/")) 
+#real.counts.ordered <- read.csv(paste(workdir, "real.counts.Hr_rel.csv", sep="/"))
+
+print(n=length(real.counts.ordered$ct_pairs), real.counts.ordered)
+
+df_by_rep <- df %>% group_by(rep) %>% summarise(mean_Hr_rel= mean(Hr_rel))
+df_by_rep$test <- with(df_by_rep, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+permutations <- df_by_rep[df_by_rep$test == "permutation test",]
+
+summary(permutations$mean_Hr_rel)
+var(permutations$mean_Hr_rel)
+
+#Fig. 3d
+pdf(paste(workdir, "fig3d.pdf", sep = "/"),
+    width = 4 / 2.54 , height = 5 / 2.54, 
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4")
+p <- ggplot(df_by_rep, aes(x=test, y=mean_Hr_rel)) + 
+  geom_boxplot(size = 0.5, colour="black", fill="white", linewidth = 0.5, outlier.size = 0.1) +
+  geom_jitter(size=0.1, alpha = 0.3) +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\nspecies","permuted\nspecies")) +
+  scale_y_continuous(name = "Relative RCE", breaks=seq(0.88,0.99,0.02), limits=c(0.885, 0.999), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+# Fig. 3e
+pdf(paste(workdir, "fig3e.pdf", sep = "/"),
+    width = 4 / 2.54 , height = 5 / 2.54,
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4") 
+library(ggforce)
+p <- ggplot(df, aes(x=test, y=Hr_rel, fill=test)) +   geom_violin() +
+  geom_point(size = 0.1, fill="black", alpha=0.1) + 
+  geom_sina(alpha=0.01) +
+  theme(legend.position="none") +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\nspecies","permuted\nspecies")) +
+  scale_y_continuous(name =   "Decomposed relative RCE", breaks=seq(0.6,0.99,0.1), limits=c(0.5, 1), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+```

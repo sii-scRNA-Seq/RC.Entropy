@@ -1,0 +1,686 @@
+---
+title: "alzheimer_example"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{alzheimer_example}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(dplyr)
+library(ggforce)
+library(ggplot2)
+library(patchwork)
+library(RColorBrewer)
+library(Seurat)
+library(scales)
+library(sf)
+library(spatstat)
+
+library(RC.entropy)
+
+SEED = 7
+set.seed(SEED)
+```
+
+Create work directory
+```{r}
+workdir <- "~/mouse_brain_alzheimer_v2"
+
+if (!dir.exists(workdir)){
+  dir.create(workdir)
+}else{
+  print("dir exists")
+}
+#setwd(workdir) # this breaks knitr during devtools::check()
+```
+
+//// SEURAT WORKFLOW 1/2
+
+This next block is a classical single-cell workflow for 10X Genomics Xenium data using Seurat.
+It serves to cluster all cells present in the sample.
+The resulting mouse_brain_after_clustering.rds file is saved as the workflow is time-consuming, enabling the user to skip this 1st step after a 1st run.
+
+Download data from https://cf.10xgenomics.com/samples/xenium/1.4.0/Xenium_V1_FFPE_TgCRND8_17_9_months/Xenium_V1_FFPE_TgCRND8_17_9_months_outs.zip
+Unzip to workdir
+```{r}
+data.dir <- paste(workdir, "Xenium_V1_FFPE_TgCRND8_17_9_months_outs", sep = "/")
+xenium.obj <- LoadXenium(data.dir, fov = "fov", assay = "Xenium")
+
+xenium.obj <- subset(xenium.obj, subset = nCount_Xenium > 0) # remove cells with 0 counts
+xenium.obj <- SCTransform(xenium.obj, assay = "Xenium")
+xenium.obj <- RunPCA(xenium.obj, npcs = 30, features = rownames(xenium.obj))
+xenium.obj <- RunUMAP(xenium.obj, dims = 1:30)
+xenium.obj <- FindNeighbors(xenium.obj, reduction = "pca", dims = 1:30)
+xenium.obj <- FindClusters(xenium.obj, resolution = 0.3)
+Idents(xenium.obj) <- xenium.obj$seurat_clusters
+xenium.obj.markers <- FindAllMarkers(xenium.obj, only.pos = FALSE)
+xenium.obj.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 20) %>%
+    ungroup() -> top20
+
+SaveSeuratRds(xenium.obj, file = "mouse_brain_after_clustering.rds")
+```
+
+START HERE by uncommenting the 1st line if you performed the Seurat workflow 1/2 previously and wish to skip it
+
+```{r}
+#xenium.obj <- LoadSeuratRds("mouse_brain_after_clustering.rds")
+```
+
+GENERATE FIGURE S1 from the manuscript
+
+```{r}
+#Fig S1a
+pdf(paste(workdir, "figs1a.pdf", sep = "/"),     fonts = c("Helvetica"), 
+    width = 14 / 2.54 , height = 8 / 2.54, # Width and height in centimeters converted to #inches
+    bg = "white",         
+    colormodel = "cmyk",    
+   paper = "A4") 
+p <- ImageDimPlot(xenium.obj, group.by = "ident", cols = "alphabet", size =  0.5, flip_xy = FALSE, dark.background = FALSE) +
+  labs(fill = "Cell types") +
+  theme(
+    panel.background = element_rect(fill="white", color="black", linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.title = element_text(family = "Helvetica", size = 7), 
+    legend.text = element_text(family = "Helvetica", size = 6),
+    legend.key = element_rect(fill = "white", colour = "black", linewidth = 0)) 
+p
+dev.off()
+
+#Fig S1b
+pdf(paste(workdir, "figs1b.pdf", sep = "/"),
+    width = 12 / 2.54 , height = 8 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4") 
+p <- DimPlot(xenium.obj,  group.by = "ident",  cols = "alphabet", raster=TRUE) +
+  theme(
+    plot.title = element_blank(),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"),
+    legend.text = element_text(family = "Helvetica", size = 6),
+    legend.key = element_rect(fill = "white"),
+    label.text = element_text(family = "Helvetica", size = 6),
+    )
+p$layers[[1]]$aes_params$stroke <- 0
+p$layers[[1]]$aes_params$size <- 0.1
+LabelClusters(p, id="ident", repel = TRUE, family = "Helvetica", size = 2, color = "black")
+p
+dev.off()
+
+# identify cells corresponding to astrocytes
+#Fig S1c
+pdf(paste(workdir, "figs1c.pdf", sep = "/"),
+    width = 8 / 2.54 , height = 10 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4") 
+ps<- list()
+for (gene in c("Gja1", "Ntsr2", "Aqp4", "Acsbg1", "Slc39a12")) {
+p <- FeaturePlot(object = xenium.obj, features = gene, raster = TRUE) + 
+  theme(
+    plot.title = element_text(family = "Helvetica", size = 6, face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size =5, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    legend.text=element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.line = element_line(color = "black",linewidth = 0.25),
+    axis.ticks = element_line(color = "black",linewidth = 0.25),
+    legend.key.height= unit(0.1, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    legend.position = c (0.1,0.2),
+    )
+p$layers[[1]]$aes_params$stroke <- 0
+p$layers[[1]]$aes_params$size <- 0.1
+ps[[gene]]<- p
+}
+layout1<-"
+AB
+CD
+E#
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+
+# identify the cluster corresponding to microglia
+#Fig S1d
+pdf(paste(workdir, "figs1d.pdf", sep = "/"), 
+    width = 8 / 2.54 , height = 10 / 2.54, # Width and height in centimeters converted to inches
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4") 
+ps<- list()
+for (gene in c("C1qa", "C1qb", "C1qc", "Ctss", "Csf1r")) {
+p <- FeaturePlot(object = xenium.obj, features = gene, raster = TRUE) + 
+  theme(
+    plot.title = element_text(family = "Helvetica", size = 6, face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size =5, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    legend.text=element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.line = element_line(color = "black",linewidth = 0.25),
+    axis.ticks = element_line(color = "black",linewidth = 0.25),
+    legend.key.height= unit(0.1, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    legend.position = c (0.1,0.2),
+    )
+p$layers[[1]]$aes_params$stroke <- 0
+p$layers[[1]]$aes_params$size <- 0.1
+ps[[gene]]<- p
+}
+layout1<-"
+AB
+CD
+E#
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+```
+
+//// SEURAT WORKFLOW 2/2
+ 
+The next blocks are a classical single-cell workflow for 10X Genomics Xenium data using Seurat.
+It serves to select cells, namely astrocytes and microglia, identified in the previous workflow. to perform the 2d round of clustering on selected cells,  identified 
+The resulting mouse_brain_after_2nd_clustering.rds file is saved as the workflow is time-consuming, enabling the user to skip this 2nd step after a 1st run.
+
+```{r}
+selection <- c("1", "4") # Subset cells 
+xenium.obj.sel <- subset(xenium.obj, subset = seurat_clusters %in% selection)
+xenium.obj.sel$seurat_clusters_rd1 <- xenium.obj.sel$seurat_clusters
+xenium.obj.sel <- SCTransform(xenium.obj.sel, assay = "Xenium")
+xenium.obj.sel <- RunPCA(xenium.obj.sel, npcs = 30, features = rownames(xenium.obj.sel))
+xenium.obj.sel <- RunUMAP(xenium.obj.sel, dims = 1:30, repulsion.strength = 30)
+xenium.obj.sel <- FindNeighbors(xenium.obj.sel, reduction = "pca", dims = 1:30)
+DimPlot(xenium.obj.sel, label=TRUE, repel = TRUE )
+
+xenium.obj.sel <- FindClusters(xenium.obj.sel, resolution = 1)
+xenium.obj.sel.markers <- FindAllMarkers(xenium.obj.sel, only.pos = FALSE) 
+xenium.obj.sel.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 20) %>%
+    ungroup() -> top20_subcluster_1_4
+
+manual_v1 <- c(
+  "Astrocytes reactive A1 (Fiber tracts)",# 0: Gsn, Vim, Cd44, C3
+  "Astrocytes (Cortex; Dkk3)",# 1 : # Increases neuronal damage
+  "Microglia DAMs (Protective, CDCc11+OPN-)",# 2 : Trem2, Tyrobp
+  "Astrocytes (Hypothalamus; Calb2)",# 3:  
+  "Astrocytes (Thalamus; Slc39a12)",# 4: 
+  "Microglia Homeostatic (Cortex)",# 5: P2ry12, Tmem119 
+  "Microglia Homeostatic (Cortex)",# 6: P2ry12, Tmem119
+  "Astrocytes (Hypothalamus; Calb2)",# 7 : 
+  "Neurons",# 8: Shisa6, Cabp7
+  "Microglia Homeostatic (Thalamus)",# 9: Cx3cr1, P2ry12, Tmem119
+  "Microglia DAMs (Pathogenic, CDCc11+OPN+)",# 10: Spp1, Itgax, Gpnmb
+  "Astrocytes reactive group 2",# 11: Gfap, Vim, Serpina3n, Cd44
+  "Microglia Homeostatic (Hippocampus)",# 12: Cx3cr1, Tmem119 
+  "Astrocytes (Striatum; Penk)",# 13: Penk,
+  "Astrocytes (Cortex; Dkk3)",# 14 : # Increases neuronal damage 
+  "Astrocytes (Cxcl10)",# 15: Cxcl10, Vim
+  "Neurons",# 16: Cbln1, Cbln4 # with adipocytes Slc17a6
+  "Neurons" # 17: Shisa6, Cabp7
+)
+xenium.obj.sel$celltypes_manual_v1 <- manual_v1[as.factor(xenium.obj.sel$seurat_clusters)]
+
+ImageDimPlot(xenium.obj.sel, group.by = "celltypes_manual_v1", cols = "Paired", size = 1.5, flip_xy = FALSE)
+DimPlot(xenium.obj.sel, size = 2, group.by = "celltypes_manual_v1", label=TRUE, repel = TRUE )
+
+#keep only astrocytes and microglia - exclude Neurons clusters
+immune <- subset(xenium.obj.sel, subset = seurat_clusters %in% c("8", "16", "17") , invert =TRUE)
+
+immune_order1 <- c(
+  "Astrocytes (Cortex; Dkk3)",
+  "Astrocytes (Cxcl10)",
+  "Astrocytes (Hypothalamus; Calb2)",
+  "Astrocytes (Striatum; Penk)",
+  "Astrocytes (Thalamus; Slc39a12)",
+  "Astrocytes reactive A1 (Fiber tracts)",
+  "Astrocytes reactive group 2",
+  "Microglia DAMs (Pathogenic, CDCc11+OPN+)",
+  "Microglia DAMs (Protective, CDCc11+OPN-)",
+  "Microglia Homeostatic (Cortex)",
+  "Microglia Homeostatic (Hippocampus)",
+  "Microglia Homeostatic (Thalamus)"
+)
+Idents(immune) <- immune$celltypes_manual_v1
+levels(immune) <- immune_order1
+
+SaveSeuratRds(immune, file = "mouse_brain_after_2nd_clustering.rds")
+```
+
+START HERE by uncommenting the next line if you performed the Seurat workflow 2/2 previously and wish to skip it
+
+```{r}
+immune <- LoadSeuratRds(paste(workdir, "mouse_brain_after_2nd_clustering.rds", sep="/"))
+```
+
+GENERATE FIGURES 1C, S2 from the manuscript
+```{r}
+colors = brewer.pal(n=length(levels(as.factor(immune$celltypes_manual_v1))), name = "Paired")
+
+#Fig 2c
+df.ct <- as.data.frame(table(immune$celltypes_manual_v1))
+pdf(paste(workdir, "fig2c.pdf", sep = "/"),
+    width = 6 / 2.54 , height = 7 / 2.54,
+    bg = "white", 
+    colormodel = "cmyk",
+    paper = "A4")
+p <- ggplot(df.ct, aes(x=forcats::fct_rev(Var1), y=Freq)) + 
+  geom_bar(stat="identity", fill = colors) + 
+  scale_x_discrete(labels = function(x)  stringr::str_wrap(x, width = 15)) +   coord_flip() +
+    labs(x="Cell counts", y="Cell types") + 
+    theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black", hjust=0.5, lineheight=0.7),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.background = element_rect(fill="white", color="black", linewidth = 0.5),
+        panel.grid.major = element_line(color="grey", linewidth = 0.5),
+        panel.grid.minor = element_line(color="grey", linewidth = 0.25),
+    )
+p
+dev.off()
+
+#Fig S2a
+pdf(paste(workdir, "figs2a.pdf", sep = "/"),
+    width = 18 / 2.54 , height = 8 / 2.54,
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4")
+p <- ImageDimPlot(immune, group.by = "ident", cols = colors, size = 0.5, flip_xy = FALSE, dark.background = FALSE, border.color = "black", border.size=0.2) + 
+  labs(fill = "Cell types") +
+  theme(
+    panel.background = element_rect(fill="white", color="black", linewidth = 0.5),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.title = element_text(family = "Sans", size = 7), 
+    legend.text = element_text(family = "Sans", size = 6),
+    legend.key = element_rect(fill = "white", colour = "black", linewidth = 0)) 
+p
+dev.off()
+
+#Fig S2b
+pdf(paste(workdir, "figs2b.pdf", sep = "/"),
+    width = 15 / 2.54 , height = 8 / 2.54,
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4")
+p <- DimPlot(immune,  group.by = "ident",  pt.size = 2, cols = colors, raster=TRUE) +
+  theme(
+    plot.title = element_blank(),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"),
+    legend.text = element_text(family = "Helvetica", size = 6),
+    legend.key = element_rect(fill = "white"),#, colour = "white", linewidth = 0),
+    label.text = element_text(family = "Helvetica", size = 6),
+    )
+p
+dev.off()
+
+#Fig S2c
+pdf(paste(workdir, "figs2c.pdf", sep = "/"),
+    width = 8 / 2.54 , height = 10 / 2.54,
+    bg = "white", 
+    colormodel = "cmyk",
+    paper = "A4")
+ps<- list()
+for (gene in c("Vim", "Gsn", "Serpina3n", "Dkk3", "Calb2", "Penk")) {
+p <- FeaturePlot(object = immune, features = gene, pt.size=5, raster = TRUE) + 
+  theme(
+    plot.title = element_text(family = "Helvetica", size = 6, face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size =5, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    legend.text=element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.line = element_line(color = "black",linewidth = 0.25),
+    axis.ticks = element_line(color = "black",linewidth = 0.25),
+    legend.key.height= unit(0.1, 'cm'),
+    legend.key.width = unit(0.2, "cm"),
+    legend.position = c (0.1,0.2),
+    )
+ps[[gene]]<- p
+}
+layout1<-"
+AB
+CD
+EF
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+
+#Fig S2d
+pdf(paste(workdir, "figs2d.pdf", sep = "/"),
+    width = 8 / 2.54 , height = 10 / 2.54,
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4")
+ps<- list()
+for (gene in c("C1qa", "C1qb", "C1qc", "Itgax", "Trem2", "Spp1")) {
+p <- FeaturePlot(object = immune, features = gene, pt.size=5, raster = TRUE) + 
+    theme(
+    plot.title = element_text(family = "Helvetica", size = 6, face = "bold", color = "black"),
+    axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.title.x = element_text(family = "Helvetica", size =5, color = "black"),
+    axis.title.y = element_text(family = "Helvetica", size = 5, color = "black"),
+    legend.text=element_text(family = "Helvetica", size = 5, color = "black"),
+    axis.line = element_line(color = "black",linewidth = 0.25),
+    axis.ticks = element_line(color = "black",linewidth = 0.25),
+    legend.position = "none",
+    )
+ps[[gene]]<- p
+}
+layout1<-"
+AB
+CD
+EF
+"
+wrap_plots(ps ,guides = 'collect', design = layout1)
+dev.off()
+
+```
+
+/// FORMAT CONVERSION 1/2 FROM SPATIAL OMICS DATA TO SPATIAL POINT PATTERN 
+
+Generate spatial point pattern (z). It uses cells centroid coordinates from .rds object and cell types (celltypes_manual_v1) annotated previously.
+
+```{r}
+
+cat_factor <- "celltypes_manual_v1" 
+ma <- immune
+
+centroids <- ma[["fov"]]$centroids
+ma.maxx <- max(centroids$x)
+ma.maxy <-max(centroids$y)
+#the observation window is defined by the minimum and maximum coordinates of cell locations, not the IF image
+w <- owin(c(0,ma.maxx), c(0,ma.maxy), unitname=c("um", "ums"))
+z <- ppp(centroids$x, centroids$y, window = w) 
+marks(z) <- data.frame(p_names = rownames(ma[[]]), cat = pull(ma[[]], cat_factor))
+```
+
+/// FORMAT CONVERSION 2/2 FROM MORPHOLOGY IMAGE TO MARKED PIXEL IMAGE (PARTITIONS) 
+
+Generate regional map (morpho).
+
+The original IF is first aligned in Xenium Explorer, from which a 3x3 alignment matrix is exported.
+Save alignment file as alignment_matrix.csv (after exporting in folder "Xenium_V1_FFPE_TgCRND8_17_9_months_if_image_alignment_files/matrix.csv" from Xenium Explorer)
+
+This is in case the morphology and spatial transcriptomics object are not aligned, i.e they don't share the same origin (0,0), scale and orientation.
+As per the Xenium alignment tutorial, the transformation matrix has translation, scaling, rotation, and reflection.
+The transformation value units are in pixels, and the image coordinates and its annotations are in microns. The (0,0) position is in the top left corner of the image.
+We use 'affine' from spatstat which takes a 2x2 matrix for rotation/reflection, and 2-values vector for translation. We then scale accounting for difference in original pixel sizes between the 2 images used for alignment.
+
+Original IF image 
+width : 15527 px (5046.08 um)
+height : 19540 px (6350.30 um)
+IFpxwidth = 0.3250
+IFpxheight = 0.3250
+
+Other ome files (same origin/scale as Xenium object)
+31348 px (6661.45 um)
+24864 px (5283.60 um)
+OMEpx width: 0.2125 um
+OMEpx height : 0.2125 um
+
+
+```{r}
+alignment_matrix_file <- paste(workdir, "alignment_matrix.csv", sep="/")
+
+IFpxwidth = 0.3250
+IFpxheight = 0.3250
+OMEpxwidth =  0.2125
+OMEpxheight = 0.2125
+
+align <- as.matrix(read.csv(alignment_matrix_file, header=F))
+aff <- align[c(1,2), c(1,2)]
+transx <- align[,3][1] * IFpxwidth
+transy <-  align[,3][2] * IFpxheight
+
+pt_geojson <- paste(workdir, "amyloid_expansion_30.geojson", sep="/")
+annotations_sf <- st_read(pt_geojson, crs = NA) # crs to specify geographic coordinates are in planar system not spheric (default)
+geo <- st_geometry(annotations_sf) 
+windows <- lapply(geo, as.owin)
+df <- st_drop_geometry(annotations_sf)
+te <- tess(tiles=windows)
+marks(te) <- df
+
+reduction_factor <- 16
+xmin <- 0 #xmin <- te$window$xrange[1]
+xmax <- 15527 #xmax <- te$window$xrange[2]
+ymin <- 0 #ymin <- te$window$yrange[2]
+ymax <- 19540 #ymax <- te$window$yrange[2]
+
+morpho <- as.im(te, dimyx=c(xmax/reduction_factor, ymax/reduction_factor))
+#for some reason, we have to rescale twice. tried multiple combination incl. scaling by 1/OMEpxwidth to no avail
+plot(morpho, col=c('cyan', 'lightpink', 'white'), col.alpha=0.5)
+# select regions to keep from the visualisation generated above (partitions_sel = c(1,3))
+morpho <- rescale.im(morpho, 1/IFpxwidth, "ums")
+morpho <- affine(morpho, mat= aff, vec=c(transx, transy ))
+morpho <- rescale.im(morpho,IFpxwidth/OMEpxwidth, "ums")
+
+#check that the two plots align
+palette = "Paired" 
+colors = brewer.pal(n=length(levels(as.factor(z$marks$cat))), name = palette)
+# Fig. 1b
+pdf(paste(workdir, "fig1b.pdf", sep = "/"),       
+    width = 24 / 2.54 , height = 20 / 2.54, 
+    bg = "white", 
+    colormodel = "cmyk", 
+    paper = "A4") 
+# run all 3 lines to create overlayed plots
+plot(z, pch=19, cex=0.05, alpha = 1, use.marks=TRUE, which.marks = "cat", cols = colors  , legend=TRUE, leg.side="left", leg.args=list(cex=2, nsymbols = length(colors)), show.window=FALSE) #
+plot(morpho, col=c('white', 'gray70', 'black'), col.alpha=0.5, ribbon=TRUE,  add=TRUE)
+plot(z, pch=19, cex=0.05, alpha = 1, use.marks=TRUE, which.marks = "cat"  , cols = colors, add=TRUE, show.window=FALSE)
+dev.off()
+```
+/// REGIONAL CO-OCCURENCE ENTROPY workflow starts here
+
+```{r}
+#Parameters setting
+map_type <- "areas" # alternative is: "sites"
+dist = 30 # this is the parameter "d"
+if ( map_type == "sites"){
+  dist = 0
+  morpho <- NULL
+}
+partitions_sel = c(1,3) # see block above where morpho is plotted to select regions of interest
+min_coocs= 50
+iter_n <- 1000 # number of random permutations of labels to run 
+
+# initialize results dataframe
+uni_cat <- unique(z$marks$cat)
+r_g <- expand.grid(uni_cat, uni_cat, as.character(partitions_sel))
+ord_ct1 <- pmin(as.character(r_g$Var1), as.character(r_g$Var2))
+ord_ct2 <- pmax(as.character(r_g$Var1), as.character(r_g$Var2))
+ct_pairs <- paste(ord_ct1, ord_ct2, sep=" <-> ")
+r_g_theo <- data.frame(ct_pairs, ord_ct1, ord_ct2, r_g$Var3)
+r_g_theo <- r_g_theo %>% distinct()
+colnames(r_g_theo) <- c('ct_pairs', 'ord_ct1', 'ord_ct2', 'g')
+
+# collect partition area
+T_all <- partition_areas(morpho, partitions_sel, map_type)
+T_g <- T_all[[1]]
+rownames(T_g) <- as.character(rownames(T_g))
+r_g_theo$Tg <- T_g[as.character(r_g_theo$g)]
+
+# 1. get results for the actual data - you may want to stop there if you are not interested in testing permutations
+z_real <- z
+#sanity_check_structs(z_real, morpho, partitions_sel, dist) #perform sanity checks, TO DO properly
+if (map_type == "areas") {
+  z_real <- select_points_in_partitions_areas(z_real, morpho, partitions_sel)
+}
+if (map_type == "sites") {
+  z_real <- select_points_in_partitions_sites(z_real, partitions_sel)
+}
+countpg <- count_coocurrences(z_real, dist)
+countpg$ct_pairs <- NULL
+names(countpg)[names(countpg) == 'n'] <- 'real.counts'
+r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+
+# 2. add the random permutations
+for (iter in 1:iter_n) {
+  print(iter)
+  z_shuf <- z
+  z_shuf$marks$cat <- sample(z_shuf$marks$cat)
+  # check where cells fall
+  #table(z_shuf$marks$marks.partition)/z_shuf$n
+  
+  #sanity_check_structs(z_shuf, morpho, partitions_sel, dist)
+  if (map_type == "areas") {
+    z_shuf <- select_points_in_partitions_areas(z_shuf, morpho, partitions_sel)
+  }
+  if (map_type == "sites") {
+    z_shuf <- select_points_in_partitions_sites(z_shuf, partitions_sel)
+  }
+  countpg <- count_coocurrences(z_shuf, dist)
+  countpg$ct_pairs <- NULL
+  names(countpg)[names(countpg) == 'n'] <- paste('rand', iter, sep="_")
+  r_g_theo <- left_join(r_g_theo, countpg, by = c('ord_ct1' = 'ord_ct1', 'ord_ct2' = 'ord_ct2', 'g' = 'g'))
+
+}
+
+#3. Save raw results from real data and permutation
+perm <- paste("coocs",iter_n, "permutations.csv", sep="_")
+write.csv(r_g_theo, paste(workdir, perm, sep="/"))
+```
+
+Checkpoint after iterations
+
+```{r}
+# Uncomment this line if you have already the time-consuming step if iterations of random permutations
+#r_g_theo <- read.csv( paste(workdir, perm, sep="/")) 
+
+#4. Convert to summary results
+reps <- c("real.counts", paste(sep="", "rand_", 1:iter_n)) 
+cols = c("ct_pairs", "ord_ct1", "ord_ct2", "g", "Tg")
+
+df <- data.frame(matrix(ncol = 2, nrow = 0))
+colnames(df) <- c('Hr_rel', 'rep')
+
+for (rep_sim in reps) {
+  print(rep_sim)
+  r_allg <- r_g_theo[,c(cols, rep_sim)]
+  ncoocs_by_ctpairs <- r_g_theo[,c(cols, rep_sim)] %>% # Count the total number of cells from each co-occurence (across all partitions)
+      replace(is.na(.), 0) %>% 
+      group_by(ct_pairs) %>% summarise(sum_n= sum(get(rep_sim)))
+  r_allg <- inner_join(r_allg, ncoocs_by_ctpairs, by="ct_pairs")
+  r_allg <- arrange(r_allg, ct_pairs, g)
+  r_all_g_fltr <-  prep_b4_calc_H(r_allg, rep_sim, min_coocs)
+  dec_H_rep <- counts_to_H(r_all_g_fltr, T_all)
+  r_all_g_fltr = dec_H_rep[[1]]
+  dec_H_r = dec_H_rep[[2]]
+  #store results from this rep in dataframe
+  df <- rbind(df, data.frame(Hr_rel = dec_H_r$Hr_rel, rep = rep_sim))
+  if (rep_sim == "real.counts"){ 
+    df.real.counts <- dec_H_rep
+  }
+}
+
+real.counts.ordered <- arrange(df.real.counts[[2]],Hr_rel)
+write.csv(real.counts.ordered,  paste(workdir, "real.counts.Hr_rel.csv", sep="/"))
+```
+
+Decomposed RCE's
+Sort by lowest (most signal) to highest (lowest signal=random) and display just the top pairs
+```{r}
+T_star <- T_all[[2]]
+T_tot <- T_all[[3]]
+
+realcnts <- df.real.counts[[1]] %>% 
+  group_by(ct_pairs) %>% 
+  summarise(sum_n = sum(n), RCE = sum(plogtg_p), g1 = ifelse(g == 1, n, 0), g2 = ifelse(g == 2, n, 0), g3 = ifelse(g == 3, n, 0) ) %>%  
+  arrange(,RCE)
+realcnts <- realcnts %>%
+  group_by(ct_pairs) %>%
+  summarise(RCE = max(RCE), relRCE= (max(RCE) - log(T_star)) / (log(T_tot) - log(T_star)),
+            n = max(sum_n),  g1 = sum(g1), g2 = sum(g2), g3 = sum(g3) ) %>% 
+  arrange(,RCE)
+#Fig. 2B
+print(n=150, realcnts)
+```
+
+Summary statistics of permutations
+Plotting of permutations against real data averaged per iteration (fig 2a) and with each decomposed RCE (fig s3a)
+Decomposed RCE's of pairs (fig 2b)
+
+```{r}
+print(n=length(real.counts.ordered$ct_pairs), real.counts.ordered)
+
+df_by_rep <- df %>% group_by(rep) %>% summarise(mean_Hr_rel= mean(Hr_rel))
+df_by_rep$test <- with(df_by_rep, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+permutations <- df_by_rep[df_by_rep$test == "permutation test",]
+
+summary(permutations$mean_Hr_rel)
+var(permutations$mean_Hr_rel)
+
+#Fig 2d
+pdf(paste(workdir, "fig2d.pdf", sep = "/"),
+    width = 4 / 2.54 , height = 5 / 2.54,
+    bg = "white",
+    colormodel = "cmyk",
+    paper = "A4")
+p <- ggplot(df_by_rep, aes(x=test, y=mean_Hr_rel)) + 
+  geom_boxplot(size = 0.5, colour="black", fill="white", linewidth = 0.5, outlier.size = 0.1) +
+  geom_jitter(size=0.1, alpha = 0.3) +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\ncell types","permuted\ncell types")) +
+  scale_y_continuous(name =  "Relative RCE", breaks=seq(0.88,0.99,0.02), limits=c(0.885, 0.999), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+
+#Fig. 2b
+print(n=length(real.counts.ordered$ct_pairs), real.counts.ordered)
+
+#Fig. 2e
+min(df[df$test == "permutation test",]$Hr_rel)
+df$test <- with(df, ifelse(rep == "real.counts" , "real.counts", "permutation test"))
+pdf(paste(workdir, "fig2e.pdf", sep = "/"),
+    width = 4 / 2.54 , height = 5 / 2.54,
+    bg = "white",
+    colormodel = "cmyk", 
+    paper = "A4") 
+p <- ggplot(df, aes(x=test, y=Hr_rel, fill=test)) +   geom_violin() +
+  geom_point(size = 0.5, fill="black", alpha=1) + 
+  geom_sina(alpha=0.01) +
+  theme(legend.position="none") +
+  xlab(element_blank()) + 
+  scale_x_discrete(limits=c("real.counts", "permutation test"), labels=c("real\ncell types","permuted\ncell types")) +
+  scale_y_continuous(name = "Decomposed relative RCE", breaks=seq(0.6,0.99,0.1), limits=c(0.5, 1), labels = percent) +
+  theme(axis.text.x = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.text.y = element_text(family = "Helvetica", size = 5, color = "black"),
+        axis.title.x = element_text(family = "Helvetica", size = 7, color = "black"),
+        axis.title.y = element_text(family = "Helvetica", size = 7, color = "black"), 
+        panel.grid.minor = element_blank())
+p
+dev.off() 
+
+
+
+```
+
